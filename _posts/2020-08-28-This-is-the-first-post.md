@@ -1,4 +1,3 @@
-
 ---
 layout: post
 title: Hello World                                # Title of the page
