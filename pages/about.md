@@ -24,6 +24,8 @@ Appication Platform : Spring-Boot / AKKA ~
 
 ETC : Kafka / Zookeeper / Docker / Logstash / 
 
+<hr/>
+
 뭔가 Active 한 취미 활용도 만들고 싶고 ( 즉, 지금은 없다 ... )
 
 뭔가 악기도 하나 배우고 싶고 ( 즈으으으윽, 지금은 안 배우고 있다 ... )
