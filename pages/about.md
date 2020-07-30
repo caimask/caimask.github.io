@@ -10,6 +10,8 @@ I'm ...
 
 Back-End Server Engineer / Data Engineer / Software Engineer
 
+> 나는 한국인 ... 영어는 ... 배우자 :)
+
 Language : Java / Scala / ~ ( Python )
 
 Stream process Platform : Flink / ~ ( Spark / Storm )
