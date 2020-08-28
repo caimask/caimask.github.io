@@ -11,6 +11,6 @@ author: caimask
 
 github 를 통해서 배포 되었고, 주소는 아래와 같다.
 
-https://github.com/GrammaTech/swap-detector
+[https://github.com/GrammaTech/swap-detector](https://github.com/GrammaTech/swap-detector)
 
 실제로 어떤 기능을 해주는지 확인해보고 포스트의 내용을 채워 가 보자.
