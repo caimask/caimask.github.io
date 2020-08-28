@@ -25,37 +25,37 @@ AWS 를 통해 시스템을 구성함에 있어서 사용하고 있던 여러 �
  
  네트워크 구성을 위한 아래의 단위 개념을 잘 이해해야 한다.
 
-### Region
+#### Region
 
  AWS의 서비스가 위치한 지리적인 장소이며, 글로벌 기준으로 지역적 위치를 묶어서 관리하는 단위.
  
 
-### Availability Zone
+#### Availability Zone
  
  Region 내에 실제 컴퓨팅 리소스들이 물리적으로 분리되어 있는 단위이다
 
 
-### Subnet
+#### Subnet
 
  VPC 내 특정 IP 주소 범위 블록. [CIDR](https://en.wikipedia.org/wiki/Classless_Inter-Domain_Routing) 형식으로 지정한다.
 
 
-### Route Table
+#### Route Table
 
  네트워크 트래픽을 전달할 위치를 결정하는 데 사용되는 라우팅이라는 규칙 집합.
 
 
-### Internet Gateway
+#### Internet Gateway
 
  VPC의 리소스와 인터넷 간의 통신을 활성화하기 위해 VPC에 연결하는 게이트웨이.
 
 
-### NAT Gateway
+#### NAT Gateway
 
  [NAT](https://docs.aws.amazon.com/ko_kr/vpc/latest/userguide/vpc-nat.html) (Network Address Translation) Gateway를 사용하여 Private Subnet의 인스턴스를 외부 인터넷 또는 기타 AWS 서비스에 연결하는 한편, 외부 인터넷에서 해당 Private Subnet의 인스턴스와의 연결 할 수 없도록 할 수 있다.
 
 
-### VPC Endpoint
+#### VPC Endpoint
 
  인터넷 게이트웨이, NAT 디바이스, VPN 연결 또는 AWS Direct Connect 연결을 필요로 하지 않고 PrivateLink 구동 지원 AWS 서비스 및 VPC 엔드포인트 서비스에 VPC를 비공개로 연결할 수 있다. 
 
