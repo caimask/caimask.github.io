@@ -1,7 +1,7 @@
 ---
 layout: post
 title: Apache Kafka
-tags: [Kafka, Kinesis, Data Stream]
+tags: [Kafka, Kinesis]
 author: caimask
 ---
 
@@ -36,38 +36,60 @@ Kafka 의 사용에 앞서서 Kafka 가 어떤 것이며, 어떤 기능을 하�
   - 이벤트 메세지 큐에 특정 point 를 지정하여 이벤트를 소모 할 수 있다.
 
 
-#### Kafka 는 어떻게 동작하는가?
+#### Kafka 주요 개념
 
-Kafka는 고성능 TCP 네트워크 프로토콜을 통해 통신하는 Server 와 Client 로 구성된 분산 시스템이다.
-
-- Server
-  - Kafka는 여러 데이터 센터 또는 클라우드 지역에 걸쳐있을 수 있는 하나 이상의 서버 클러스터로 실행된다. 이러한 서버 중 일부는 **브로커**라고 하는 스토리지 계층을 형성한다. 다른 서버는 Kafka Connect 를 실행 하여 데이터를 이벤트 스트림으로 지속적으로 가져오고 내 보내어 관계형 데이터베이스 및 기타 Kafka 클러스터와 같은 기존 시스템과 Kafka를 통합한다. 
-Kafka 클러스터는 확장성이 뛰어나고 내결함성이 있다. 서버 중 하나에 장애가 발생하면 다른 서버가 작업을 대신하여 데이터 손실없이 지속적인 운영을 보장한다
-
-
-- Client
-  - 네트워크 문제 또는 머신 장애가 발생하는 경우에도 내결함성 방식으로 대규모로 이벤트 스트림을 읽고, 쓰고, 처리하는 분산 애플리케이션 및 마이크로 서비스를 구성 할 수 있다. Kafka 는 Kafka 커뮤니티에서 제공 하는 수십 개의 Client에 의해 보강 된 일부 Client와 함께 제공된다. Client는 Go, Python, C / C ++ 및 기타 많은 프로그래밍 언어와 REST API를위한 상위 수준 Kafka Streams 라이브러리를 포함하여 Java 및 Scala에 사용할 수 있습니다
-
+- producer : 메세지 생산자
+- consumer : 메세지 소비자
+- consumer group : consumer 들끼리 메세지를 나눠서 가져간다. offset 을 공유하여 중복으로 가져가지 않는다.
+- broker : 카프카 서버를 가리킴
+- zookeeper : 카프카 서버 (+클러스터) 상태를 관리하고
+- cluster : 브로커들의 묶음
+- topic : 메세지 종류
+- partitions : topic 이 나눠지는 단위
+- log : 1개의 메세지
+- offset : 파티션 내에서 각 메시지가 가지는 unique id
 
 
 #### Kafka & Zookeeper
 
 Kafka를 운영하기 위해서 Zookeeper를 함께 구성하도록 하고 있다. 따라서 Zookeeper 가 무엇이고 어떤 역할을 하는지 이해해야 한다.
 
+![Kafka Components]({{ "/assets/img/kafka_components.png"}}) 
 
+- zookeeper 가 kafka 의 상태와 클러스터 관리를 해준다.
+
+: kafka는 클러스터에서 전체 컨트롤러 상태를 관리하는 방법이 필요합니다. 
+
+어떤 이유로 든 컨트롤러가 중단되면 나머지 브로커 세트에서 다른 컨트롤러를 선택하기위한 프로토콜이 있습니다. 
+
+컨트롤러 선택, 심장 박동 등의 실제 메커니즘은 크게 ZooKeeper에서 구현됩니다. 
+
+ZooKeeper는 클러스터 메타 데이터, 리더 팔로워 상태, 할당량, 사용자 정보, ACL 및 기타 하우스 키핑 항목을 유지 관리하는 구성 저장소 역할도합니다. 
+
+근본적인 험담 및 합의 프로토콜로 인해 ZooKeeper 노드의 수는 홀수여야합니다.
 
 
 #### Kafka API
 
-1. Admin API  : 여러 topic, broker 및 기타 Kafka 객체를 관리하고 검사하기 위한 API
+1. Admin API  
 
-2. Producer API  : 하나 이상의 Kafka topic에 이벤트 스트림을 Publish (Write) 하기 위한 API
+: 여러 topic, broker 및 기타 Kafka 객체를 관리하고 검사하기 위한 API
 
-3. Consumer API  : 하나 이상의 topic를 Subscribe (Read) 하고 생성된 이벤트 스트림을 처리 하기 위한 API
+2. Producer API  
 
-4. Kafka Streams API : 스트림 처리 애플리케이션 및 마이크로 서비스 구현을 위한 API 
+: 하나 이상의 Kafka topic에 이벤트 스트림을 Publish (Write) 하기 위한 API
 
-5. Kafka Connect API : Kafka와 통합 할 수 있도록 외부 시스템 및 애플리케이션에서 이벤트 스트림을 consume (read) 또는 produce (write) 하는 재사용 가능한 데이터 가져오기 / 내보내기 커넥터를 구축하고 실행하는 API
+3. Consumer API  
+
+: 하나 이상의 topic를 Subscribe (Read) 하고 생성된 이벤트 스트림을 처리 하기 위한 API
+
+4. Kafka Streams API 
+
+: 스트림 처리 애플리케이션 및 마이크로 서비스 구현을 위한 API 
+
+5. Kafka Connect API 
+
+: Kafka와 통합 할 수 있도록 외부 시스템 및 애플리케이션에서 이벤트 스트림을 consume (read) 또는 produce (write) 하는 재사용 가능한 데이터 가져오기 / 내보내기 커넥터를 구축하고 실행하는 API
 
 
 
