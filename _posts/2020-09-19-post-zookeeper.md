@@ -12,7 +12,8 @@ author: caimask
 - 상태 정보를 Znode라 불리는 곳에 key-value 형태로 저장한다. 이 Znode에 저장된 key-value를 이용하여 분산 애플리케이션은 서로 데이터를 주고 받는다.
 - Znode는 일반 컴퓨터의 파일이나 폴더 개념으로 생각하자.
 
-* 코디네이션 (coordination) 시스템
+
+### 코디네이션 (coordination) 시스템
 
 coordination 의 영어 사전적인 의미로 '전제적으로 균형 있고 조화롭게 갖추어 꾸미는 일' 을 의미 합니다. ( coordinator : coordination 을 전문적으로 하는 사람 )
 
