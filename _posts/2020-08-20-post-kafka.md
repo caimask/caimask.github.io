@@ -77,6 +77,7 @@ Kafka를 운영하기 위해서 Zookeeper를 함께 구성하도록 하고 있�
 
 ### Kafka VS Kinesis
 
+![Kafka VS Kinesis]({{ "/assets/img/kafka_vs_kinesis.png"}})
 
 
-참조 : [링크](https://devidea.tistory.com/68)
+출처 / 참조 : [링크](https://devidea.tistory.com/68)
