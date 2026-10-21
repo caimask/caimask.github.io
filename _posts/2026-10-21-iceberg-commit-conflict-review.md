@@ -1,3 +1,10 @@
+---
+layout: post
+title: Iceberg 커밋 경합 리뷰
+tags: [Iceberg, Kafka Connect]
+author: caimask
+---
+
 # Iceberg 커밋 경합 리뷰
 
 October 08, 2026
