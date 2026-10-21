@@ -493,7 +493,7 @@ S6 merge-on-read 전환 + 컴팩션(앞 문서 7장), 또는 `bucket(id_id)`. �
 
 ## 8. 참고 {#refs}
 
-- 앞 문서: [Iceberg 커밋 경합 리뷰](/2026/10/21/iceberg-commit-conflict-review.html)
+- 앞 문서: [Iceberg 커밋 경합 리뷰](/2026/10/08/iceberg-commit-conflict-review.html)
 - [Apache Iceberg: Spark Writes (MERGE INTO, overwritePartitions)](https://iceberg.apache.org/docs/latest/spark-writes/)
 - [Apache Iceberg: Kafka Connect (latest)](https://iceberg.apache.org/docs/latest/kafka-connect/) · [nightly](https://iceberg.apache.org/docs/nightly/kafka-connect/)
 - [apache/iceberg: kafka-connect 소스 (공식, 현재 관리)](https://github.com/apache/iceberg/tree/main/kafka-connect)
