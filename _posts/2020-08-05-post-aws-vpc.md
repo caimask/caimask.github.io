@@ -232,17 +232,21 @@ ZooKeeper의 임시 노드와 leader 선출은 [Apache ZooKeeper](/2020/09/19/po
 
 <div class="table-wrap" markdown="1">
 
-| 개선 | 지표 | 지금 | 적용 후 (예상) | 근거 |
+| 개선 작업 | 무엇이 바뀌나 | 지금 | 적용 후 (예상) | 근거 |
 | --- | --- | --- | --- | --- |
-| AZ별 private subnet | AZ 하나 장애 시 서버 영역 | 전체 중단 | <span class="pill ok">남은 AZ에서 계속 운영</span> | 5장 |
-| AZ별 NAT Gateway | NAT 단일 장애점 | 1개 (그 AZ가 죽으면 외부 통신 단절) | <span class="pill ok">없음</span> AZ마다 자기 NAT 사용 | 4장 |
-| RDS Multi-AZ | DB가 있는 AZ 장애 시 | DB가 단일 AZ에 있어 함께 중단 | <span class="pill ok">standby로 자동 전환</span> 보통 1~2분 | 6장 |
-| 합의 클러스터 3 AZ 배치 | ZooKeeper·KRaft controller의 AZ 장애 내성 | 이전 구성에서 다루지 않음 | <span class="pill ok">AZ 1곳 장애에도 과반수 유지</span> | 4장 |
-| HDFS NameNode HA | NameNode 장애 시 | 단일 NameNode라면 클러스터 중단 | <span class="pill ok">ZKFC가 standby 자동 승격</span> | 6장 |
-| `client.rack` 설정 | Kafka consumer의 AZ 간 전송 | 기본 설정이면 다른 AZ의 leader에서 읽음 | <span class="pill ok">같은 AZ replica에서 읽음</span> | 7장 |
-| AZ별 NAT, 동기 복제 | 비용 | NAT 1개 | <span class="pill warn">NAT 시간당 요금 × AZ 수 + AZ 간 전송 요금</span> 가용성의 대가 | 4장, 6장 |
+| **private subnet을 AZ마다 하나씩 두기** | AZ 하나 장애 시 서버 영역 | 전체 중단 | 남은 AZ에서 계속 운영 | 5장 |
+| **NAT Gateway를 AZ마다 두기** | NAT 단일 장애점 | 1개 (그 AZ가 죽으면 외부 통신 단절) | 없음 (AZ마다 자기 NAT 사용) | 4장 |
+| **RDS를 Multi-AZ로 전환** | DB가 있는 AZ 장애 시 | DB가 단일 AZ에 있어 함께 중단 | standby로 자동 전환 (보통 1~2분) | 6장 |
+| **ZooKeeper·KRaft controller를 AZ 3곳에 나눠 배치** | 합의 클러스터의 AZ 장애 내성 | 이전 구성에서 다루지 않음 | AZ 1곳이 죽어도 과반수 유지 | 4장 |
+| **HDFS NameNode를 HA로 구성** | NameNode 장애 시 | 단일 NameNode라면 클러스터 중단 | ZKFC가 standby를 자동 승격 | 6장 |
+| **Kafka consumer에 `client.rack` 설정** | consumer의 AZ 간 전송 | 기본 설정이면 다른 AZ의 leader에서 읽음 | 같은 AZ의 replica에서 읽음 | 7장 |
 
 </div>
+
+> **대가로 내주는 것**
+>
+> 비용: NAT 1개 → **NAT 시간당 요금 × AZ 수 + AZ 간 전송 요금**. AZ별 NAT와 동기 복제로 얻는 가용성의 대가입니다. (4장, 6장)
+{: .callout .warn}
 
 > **측정 방법**
 >

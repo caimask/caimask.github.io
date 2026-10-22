@@ -498,14 +498,14 @@ S6 merge-on-read 전환 + 컴팩션(앞 문서 7장), 또는 `bucket(id_id)`. �
 
 <div class="table-wrap" markdown="1">
 
-| 구분 | 이전 (upsert 커넥터) | 전환 후 (buffer + Spark 배치) |
+| 무엇이 바뀌었나 | 이전 (upsert 커넥터) | 전환 후 (buffer + Spark 배치) |
 | --- | --- | --- |
-| 테이블당 커밋 주체 | 최대 8개 task | <span class="pill ok">1</span> 배치 job |
-| 커밋 빈도 | 몇 초마다 | <span class="pill ok">10분에 테이블당 2~3회</span> |
-| equality delete | 레코드마다 | <span class="pill ok">0</span> log는 append, mirror는 CoW `MERGE` |
-| 재처리 | upsert 멱등성에 의존 | <span class="pill ok">결정적 파일명 + 파티션 덮어쓰기</span> 같은 윈도우를 다시 돌려도 중복 없음 |
-| 원본 보존 | 없음 | <span class="pill ok">S3 버퍼</span> Iceberg와 별개로 원본 이벤트를 Parquet로 보관. 백필과 누락 점검의 기준 |
-| 장애 처리 | 반쪽 파일, 고아 파일 | <span class="pill ok">multipart upload abort</span> checkpoint보다 뒤처지면 따라잡기, 백필 경로 분리 |
+| 테이블당 커밋 주체 | 최대 8개 task | 배치 job 1개 |
+| 커밋 빈도 | 몇 초마다 | 10분에 테이블당 2~3회 |
+| equality delete | 레코드마다 | 0 (log는 append, mirror는 CoW `MERGE`) |
+| 재처리 | upsert 멱등성에 의존 | 결정적 파일명 + 파티션 덮어쓰기. 같은 윈도우를 다시 돌려도 중복 없음 |
+| 원본 보존 | 없음 | S3 버퍼. Iceberg와 별개로 원본 이벤트를 Parquet로 보관해 백필과 누락 점검의 기준으로 씀 |
+| 장애 처리 | 반쪽 파일, 고아 파일이 남음 | multipart upload abort. checkpoint보다 뒤처지면 따라잡기, 백필 경로 분리 |
 
 </div>
 
@@ -517,21 +517,25 @@ S6 merge-on-read 전환 + 컴팩션(앞 문서 7장), 또는 `bucket(id_id)`. �
 
 <div class="table-wrap" markdown="1">
 
-| 개선 | 지표 | 지금 | 적용 후 (예상) | 근거 |
+| 개선 작업 | 무엇이 바뀌나 | 지금 | 적용 후 (예상) | 근거 |
 | --- | --- | --- | --- | --- |
-| 파일 단위 증분 처리 (또는 B1 + S1) | 늦게 도착한 버퍼 파일의 누락 | 오류 없이 누락 가능 | <span class="pill ok">0</span> 버퍼와 log 건수 일치 | 3장 |
-| B2 offset 커밋 수정 | 타임스탬프 역전 시 유실 | 재시작·리밸런싱 때 발생 가능 | <span class="pill ok">0</span> | 4장 |
-| S2 MERGE 원본 쿼리 | mirror에 반영되지 않는 변경 | 세 컬럼 `max`가 엇갈리면 누락 | <span class="pill ok">0</span> 키별 `row_number` 1건 | 5장 |
-| S2 MERGE 원본 쿼리 | MERGE가 읽는 log 범위 | 누적 전체, 시간이 갈수록 증가 | <span class="pill ok">10분 윈도우 하나</span> 실행 시간이 운영 기간과 무관해짐 | 5장 |
-| S3 순서 값 재인코딩 | 같은 초에 ord ≥ 1000일 때 순서 역전·값 충돌 | 대량 변경 시 발생 | <span class="pill ok">0</span> | 5장 |
-| S4 버전 비교 | 늦게 온 과거 변경이 최신 상태를 덮어씀 | 백필·지연 시 발생 | <span class="pill ok">0</span> 처리 순서와 무관한 결과 | 5장 |
-| S5 타입 통일 + 테이블 단위 격리 | 한 컬렉션의 타입 혼재로 멈추는 범위 | 같은 실행의 모든 테이블 | <span class="pill ok">그 테이블 하나</span> | 5장 |
-| S7 일 파티션 | log 테이블 파티션 수 | 연간 약 52,000개 | <span class="pill ok">연간 365개</span> | 5장 |
-| S8 중복 실행 방지 | 같은 테이블에 MERGE하는 driver | pod 재시작 시 2개 가능 | <span class="pill ok">항상 1개</span> | 5장 |
-| log 적재를 공식 Sink로 (대안) | 운영 구성요소 | 커넥터, S3 버퍼, CronJob, Kyuubi, checkpoint | <span class="pill ok">Sink + mirror MERGE 배치</span> 넘겨받기 문제 자체가 사라짐 | 7장 |
-| 최신성 | mirror 반영 지연 | 15~25분 | <span class="pill warn">그대로</span> 이번 개선의 목표가 아님 | 2장 |
+| **윈도우 단위 대신 버퍼 파일 단위로 증분 처리** (또는 B1 + S1 수정) | 늦게 도착한 버퍼 파일의 누락 | 오류 없이 누락 가능 | 0 (버퍼와 log 건수 일치) | 3장 |
+| **offset은 열린 writer 중 가장 작은 offset 직전까지만 커밋** (B2) | 타임스탬프 역전 시 유실 | 재시작·리밸런싱 때 발생 가능 | 0 | 4장 |
+| **MERGE 원본을 키별 최신 1건으로, 이번 윈도우만 읽기** (S2) | mirror에 반영되지 않는 변경 | 세 컬럼 `max`가 엇갈리면 누락 | 0 (키별 `row_number` 1건) | 5장 |
+| | MERGE가 읽는 log 범위 | 누적 전체, 시간이 갈수록 증가 | 10분 윈도우 하나. 실행 시간이 운영 기간과 무관해짐 | 5장 |
+| **순서 값 `__source_ts_ms_ord`를 다시 인코딩** (S3) | 같은 초에 ord ≥ 1000일 때 순서 역전·값 충돌 | 대량 변경 시 발생 | 0 | 5장 |
+| **MERGE에서 버전을 비교해 더 새로운 변경만 반영** (S4) | 늦게 온 과거 변경이 최신 상태를 덮어씀 | 백필·지연 시 발생 | 0. 처리 순서와 무관한 결과 | 5장 |
+| **컬럼 타입을 통일하고 실패를 테이블 단위로 격리** (S5) | 한 컬렉션의 타입 혼재로 멈추는 범위 | 같은 실행의 모든 테이블 | 그 테이블 하나 | 5장 |
+| **log 테이블 파티션을 일 단위로 바꾸기** (S7) | log 테이블 파티션 수 | 연간 약 52,000개 | 연간 365개 | 5장 |
+| **배치 중복 실행 막기** (S8) | 같은 테이블에 MERGE하는 driver | pod 재시작 시 2개 가능 | 항상 1개 | 5장 |
+| **log 적재를 공식 Iceberg Sink로 바꾸기** (대안) | 운영 구성요소 | 커넥터, S3 버퍼, CronJob, Kyuubi, checkpoint | Sink + mirror MERGE 배치. 넘겨받기 문제 자체가 사라짐 | 7장 |
 
 </div>
+
+> **바뀌지 않는 것**
+>
+> mirror 반영 지연: 15~25분 → **그대로**. 이번 개선의 목표가 아닙니다. (2장)
+{: .callout .info}
 
 > **측정 방법**
 >

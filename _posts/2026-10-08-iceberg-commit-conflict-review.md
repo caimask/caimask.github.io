@@ -734,20 +734,24 @@ log 테이블은 공식 Iceberg Kafka Connect Sink 또는 Flink로 append합니�
 
 <div class="table-wrap" markdown="1">
 
-| 개선 | 지표 | 지금 | 적용 후 (예상) | 근거 |
+| 개선 작업 | 무엇이 바뀌나 | 지금 | 적용 후 (예상) | 근거 |
 | --- | --- | --- | --- | --- |
-| 커밋 묶기 + 단일 committer | major mirror 테이블당 커밋 | 몇 초마다, writer 최대 8개가 경쟁 | <span class="pill ok">1~5분에 1회</span> | 5장 |
-| 커밋 묶기 | 커밋 재시도와 backoff | 상시 발생 | <span class="pill ok">거의 없음</span> 경쟁 주체가 하나 | 2장 |
-| 커밋 묶기 | 처리량 확장 | 커밋 경쟁에 묶임 | <span class="pill ok">writer 수에 비례</span> | 5장 |
-| 커밋 묶기 | data·delete·manifest·metadata 파일 수 | 커밋마다 생성 | <span class="pill ok">수십~수백 분의 1</span> 몇 초 → 5분 | 7장 |
-| 테이블 캐시 + `refresh()` | Glue GetTable, metadata.json 읽기 | `put()`마다 | <span class="pill ok">커밋 주기마다</span> | 1장 |
-| log 테이블 append 전환 | log 테이블 equality delete | 레코드마다 1행 | <span class="pill ok">0</span> | 6장 |
-| `bucket(16, _oid)` 파티션 | equality delete와 컴팩션 범위 | 테이블 전체 | <span class="pill ok">1/16</span> | 7장 |
-| 증분 컴팩션 + `partial-progress` | 최적화 작업 | 테이블 전체를 한 번에 다시 쓰다 커밋 직전에 실패 | <span class="pill ok">작은 커밋 여러 번</span> 실패해도 끝난 그룹은 유지 | 7장 |
-| mirror를 log 기반 `MERGE`로 전환 + v3 | mirror delete 파일 | 계속 누적 | <span class="pill ok">data 파일당 deletion vector 1개</span> | 7장 |
-| 커밋 주기 | 최신성 | 수 초 (경합이 없을 때) | <span class="pill warn">1~5분</span> 대가로 내주는 것 | 5장 |
+| **커밋을 1~5분 단위로 묶고, 테이블당 한 곳에서만 커밋** | major mirror 테이블당 커밋 | 몇 초마다, writer 최대 8개가 경쟁 | 1~5분에 1회, 1곳 | 5장 |
+| | 커밋 재시도와 backoff | 상시 발생 | 거의 없음 (경쟁 주체가 하나) | 2장 |
+| | 처리량 | 커밋 경쟁에 묶임 | writer 수에 비례해 늘어남 | 5장 |
+| | data·delete·manifest·metadata 파일 수 | 커밋마다 생성 | 수십~수백 분의 1 | 7장 |
+| **테이블을 캐시하고 커밋할 때만 `refresh()`** | Glue GetTable과 metadata.json 읽기 | `put()`마다 | 커밋 주기마다 | 1장 |
+| **log 테이블을 upsert에서 append로 전환** | log 테이블 equality delete | 레코드마다 1행 | 0 | 6장 |
+| **mirror 테이블에 `bucket(16, _oid)` 파티션 추가** | equality delete와 컴팩션 범위 | 테이블 전체 | 1/16 | 7장 |
+| **컴팩션을 증분으로 나눠 자주 실행** (`partial-progress`) | 최적화 작업 | 테이블 전체를 한 번에 다시 쓰다 커밋 직전에 실패 | 작은 커밋 여러 번. 실패해도 끝난 그룹은 유지 | 7장 |
+| **mirror를 log 기반 `MERGE`로 바꾸고 v3 적용** | mirror delete 파일 | 계속 누적 | data 파일당 deletion vector 1개 | 7장 |
 
 </div>
+
+> **대가로 내주는 것**
+>
+> 최신성: 수 초(경합이 없을 때) → **1~5분**. 커밋을 묶은 만큼 쿼리에 늦게 보입니다. (5장)
+{: .callout .warn}
 
 > **측정 방법**
 >

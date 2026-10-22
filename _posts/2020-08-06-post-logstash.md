@@ -189,19 +189,23 @@ CDC로 바꾸면 수집 쪽 문제는 대부분 사라집니다. 대신 문제�
 
 <div class="table-wrap" markdown="1">
 
-| 개선 | 지표 | 지금 | 적용 후 (예상) | 근거 |
+| 개선 작업 | 무엇이 바뀌나 | 지금 | 적용 후 (예상) | 근거 |
 | --- | --- | --- | --- | --- |
-| binlog CDC | 감지하는 변경 | insert만 | <span class="pill ok">insert, update, delete</span> 변경 전후 값까지 | 4장 |
-| binlog CDC | 늦게 커밋된 행의 누락 | 쓰기가 몰리면 발생 가능 | <span class="pill ok">0</span> binlog 보존 기간 안이면 | 3장 |
-| binlog CDC | 처리량 상한 | 초당 2,000건 (5초 × 1만 건) | <span class="pill ok">설정에 박힌 상한 없음</span> | 3장 |
-| binlog CDC | 지연 | 폴링 주기 0~5초 + 조회 시간 | <span class="pill ok">폴링 주기 없음</span> 커밋 순서대로 바로 전달 | 4장 |
-| binlog CDC | 운영 DB 부하 | 5초마다 조회 | <span class="pill ok">조회 없음</span> binlog 읽기만 | 4장 |
-| binlog CDC | 스키마 변경 대응 | 쿼리 수정과 재배포 | <span class="pill ok">스키마 변경 이벤트로 전달</span> | 4장 |
-| keystore | 계정 정보 | 설정 파일에 평문 | <span class="pill ok">keystore 참조</span> | 1장 |
-| binlog CDC | 재시작 시 중복 | at-least-once | <span class="pill info">그대로</span> 이벤트의 binlog 위치를 중복 제거 키로 쓸 수 있음 | 4장 |
-| binlog CDC | 하류의 반영 부담 | insert를 append | <span class="pill warn">update·delete를 순서대로 반영해야 함</span> 대가로 생기는 일 | 5장 |
+| **MySQL 폴링을 binlog CDC(Debezium)로 바꾸기** | 감지하는 변경 | insert만 | insert, update, delete (변경 전후 값까지) | 4장 |
+| | 늦게 커밋된 행의 누락 | 쓰기가 몰리면 발생 가능 | 0 (binlog 보존 기간 안이면) | 3장 |
+| | 처리량 상한 | 초당 2,000건 (5초 × 1만 건) | 설정에 박힌 상한 없음 | 3장 |
+| | 지연 | 폴링 주기 0~5초 + 조회 시간 | 폴링 없이 커밋 순서대로 바로 전달 | 4장 |
+| | 운영 DB 부하 | 5초마다 조회 | 조회 없이 binlog만 읽음 | 4장 |
+| | 스키마 변경 대응 | 쿼리 수정과 재배포 | 스키마 변경 이벤트로 전달 | 4장 |
+| **DB 계정 정보를 keystore로 옮기기** | 계정 정보 보관 | 설정 파일에 평문 | keystore 참조 | 1장 |
 
 </div>
+
+> **바뀌지 않는 것과 대가로 생기는 일**
+>
+> - 재시작 시 중복: at-least-once → **그대로**. 다만 이벤트의 binlog 위치를 중복 제거 키로 쓸 수 있습니다. (4장)
+> - 하류의 반영 부담: insert를 append → **update·delete를 순서대로 반영해야 함**. (5장)
+{: .callout .warn}
 
 > **측정 방법**
 >

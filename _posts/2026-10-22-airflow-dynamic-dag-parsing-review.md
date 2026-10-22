@@ -436,20 +436,24 @@ factory 모듈 + 생성기로 DAG 파일 N개 생성(6장). pre/post hook 컬럼
 
 <div class="table-wrap" markdown="1">
 
-| 개선 | 지표 | 지금 | 적용 후 (예상) | 근거 |
+| 개선 작업 | 무엇이 바뀌나 | 지금 | 적용 후 (예상) | 근거 |
 | --- | --- | --- | --- | --- |
-| ③ 워커 파싱 축소 | 태스크 1개 시작 시 만드는 DAG | 300개 | <span class="pill ok">1개</span> | 5장 |
-| ③ 워커 파싱 축소 | DAG 1회 실행에서 만드는 DAG 객체 | 약 2,100개 | <span class="pill ok">약 7개</span> | 3장 |
-| ① pool 생성 제거 | 파싱 1회당 pool 생성 호출 | 300회 | <span class="pill ok">0회</span> | 5장 |
-| ② SSM 지연 로딩 | 파싱마다 SSM API 호출 | 1회 (스케줄러 30초마다 + 태스크마다) | <span class="pill ok">0회</span> 감사 로그를 보낼 때만 | 5장 |
-| ④ 설정 캐시 | MySQL 장애 시 사라지는 DAG | 300개 전체 | <span class="pill ok">0개</span> 마지막 캐시로 유지 | 4장, 5장 |
-| 파일 분리 | 파싱 병렬도 | 1 프로세스 | <span class="pill ok">`parsing_processes`만큼</span> | 6장 |
-| 파일 분리 | 대상 증가에 따른 `dagbag_import_timeout` 위험 | N에 비례해 커짐 | <span class="pill ok">N과 무관</span> | 6장 |
-| 파일 분리 | 장애 범위 | 300개 전체 | <span class="pill ok">DAG 하나</span> | 6장 |
-| 파일 분리 | 설정 변경 이력 | DB 상태에만 있음 | <span class="pill ok">git 이력</span> | 6장 |
-| 파일 분리 | 설정 반영 속도 | 다음 파싱 때 | <span class="pill warn">생성기 주기만큼 늦음</span> 대가로 내주는 것 | 6장 |
+| **워커에서는 실행할 DAG 하나만 만들기** (③) | 태스크 1개 시작 시 만드는 DAG | 300개 | 1개 | 5장 |
+| | DAG 1회 실행에서 만드는 DAG 객체 | 약 2,100개 | 약 7개 | 3장 |
+| **`create_dag()`에서 pool 생성 호출 없애기** (①) | 파싱 1회당 pool 생성 호출 | 300회 | 0회 | 5장 |
+| **SSM 호출을 실제로 쓰는 시점까지 미루기** (②) | 파싱마다 SSM API 호출 | 1회 (스케줄러 30초마다 + 태스크마다) | 0회. 감사 로그를 보낼 때만 호출 | 5장 |
+| **설정을 캐시에서 읽고, 장애 시 마지막 캐시로 버티기** (④) | MySQL 장애 시 사라지는 DAG | 300개 전체 | 0개 | 4장, 5장 |
+| **대상마다 얇은 DAG 파일로 나누고 공통 factory 사용** | 파싱 병렬도 | 1 프로세스 | `parsing_processes`만큼 | 6장 |
+| | 대상 증가에 따른 `dagbag_import_timeout` 위험 | 대상 수 N에 비례해 커짐 | N과 무관 | 6장 |
+| | 장애 범위 | 300개 전체 | DAG 하나 | 6장 |
+| | 설정 변경 이력 | DB 상태에만 있음 | git 이력으로 남음 | 6장 |
 
 </div>
+
+> **대가로 내주는 것**
+>
+> 설정 반영 속도: 다음 파싱 때 → **생성기 실행 주기만큼 늦음**. 파일을 나누면 DB의 설정이 파일로 만들어져야 반영됩니다. (6장)
+{: .callout .warn}
 
 > **측정 방법**
 >

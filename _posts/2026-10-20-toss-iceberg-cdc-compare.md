@@ -355,17 +355,21 @@ private boolean internalPosDelete(StructLike key) {
 
 <div class="table-wrap" markdown="1">
 
-| 개선 | 지표 | 지금 | 적용 후 (예상) | 근거 |
+| 개선 작업 | 무엇이 바뀌나 | 지금 | 적용 후 (예상) | 근거 |
 | --- | --- | --- | --- | --- |
-| 1단계: 커밋 묶기 | 테이블당 커밋 | 몇 초마다, 최대 8개 writer | <span class="pill ok">5분에 최대 3회</span> 경합은 사실상 사라짐 | 4장 |
-| 1단계: 레지스트리 | 같은 커밋 안의 중복 행 | 0. 단, 레지스트리 없이 커밋만 묶으면 스키마 변경 때 발생 | <span class="pill ok">커밋을 묶어도 0</span> | 3장, 5장 |
-| 1단계: 레지스트리 | 커밋 안에서 파티션을 옮긴 id | 이전 위치를 지우지 못함 | <span class="pill ok">position delete로 정확히 삭제</span> | 5장 |
-| 1단계: 쓰기·커밋 분리 | 실패 시 고아 파일 | 남음 | <span class="pill ok">abort로 정리</span> | 5장 |
-| 2단계: coordinator | 테이블당 커밋 | 5분에 최대 3회 | <span class="pill ok">1회</span> | 6장 |
-| 2단계: coordinator | 전달 보장 | at-least-once + upsert 멱등성 | <span class="pill ok">exactly-once</span> 스냅샷에 offset 기록 | 6장 |
-| 커밋 간격 | mirror 최신성 | 수 초 (경합이 없을 때) | <span class="pill warn">5분 이내</span> 배치 방식(15~25분)보다는 빠름 | 7장 |
+| **1단계: 커밋을 5분 간격으로 묶기** | 테이블당 커밋 | 몇 초마다, 최대 8개 writer | 5분에 최대 3회. 경합은 사실상 사라짐 | 4장 |
+| **1단계: `insertedRowMap`을 writer 밖 레지스트리로 옮기기** | 같은 커밋 안의 중복 행 | 0. 단, 레지스트리 없이 커밋만 묶으면 스키마 변경 때 발생 | 커밋을 묶어도 0 | 3장, 5장 |
+| | 커밋 안에서 파티션을 옮긴 id | 이전 위치를 지우지 못함 | position delete로 정확히 삭제 | 5장 |
+| **1단계: `put()`은 쓰기만, 커밋은 `preCommit()`에서** | 실패 시 고아 파일 | 남음 | abort로 정리 | 5장 |
+| **2단계: coordinator가 테이블당 한 번만 커밋** | 테이블당 커밋 | 5분에 최대 3회 | 1회 | 6장 |
+| | 전달 보장 | at-least-once + upsert 멱등성 | exactly-once (스냅샷에 offset 기록) | 6장 |
 
 </div>
+
+> **대가로 내주는 것**
+>
+> mirror 최신성: 수 초(경합이 없을 때) → **5분 이내**. 그래도 배치 방식(15~25분)보다는 빠릅니다. (7장)
+{: .callout .warn}
 
 > **측정 방법**
 >
