@@ -5,7 +5,10 @@ tags: [Iceberg, Kafka Connect]
 author: caimask
 ---
 
-MongoDB CDC 이벤트를 Kafka에서 Iceberg로 적재하던 자체 개발 Sink Connector가 느렸던 원인을 짚고, "Iceberg도 이제 row lock으로 처리된다"는 정보가 맞는지, 그리고 대용량 데이터를 빠르게 적재하려면 어떤 방식을 써야 하는지 정리한 문서입니다.
+MongoDB CDC 이벤트를 Kafka에서 Iceberg로 적재하려고 제가 설계·개발한 Sink Connector가 왜 느렸는지 돌아본 문서입니다. 당시 세웠던 "Iceberg도 이제 row lock으로 처리된다"는 가정이 맞았는지, 대용량 데이터를 빠르게 적재하려면 어떤 구조가 맞는지를 함께 정리했습니다. 이 검토를 바탕으로 커넥터를 고치는 대신 buffer sink 커넥터 + Spark 배치 구조로 전환했고, 전환한 구조는 [Buffer Writer 배치 적재 리뷰](/2026/10/15/buffer-writer-batch-review.html)에서 다룹니다.
+
+역할: 커넥터 설계·개발(2023-08 ~ 2024-12 archive), 이후 buffer + Spark 배치 구조로 전환
+{: .meta}
 
 작성 2026-10-08 · 보강 2026-10-22 · Iceberg 1.4.3 · Glue Catalog
 {: .meta}
@@ -14,13 +17,14 @@ MongoDB CDC 이벤트를 Kafka에서 Iceberg로 적재하던 자체 개발 Sink 
 
 ## 요약 {#tldr}
 
-1. **당시 "table lock" 현상의 정체**: Iceberg는 lock을 쓰지 않고 낙관적 동시성 제어(OCC)로 동작합니다. 한 테이블의 커밋은 한 번에 하나씩만 반영되며, 경쟁에서 진 writer는 재시도합니다. 커넥터가 **몇 초마다, 테이블당 최대 8개 writer에서** 커밋하면서 재시도가 폭주한 것이 원인입니다. 커밋 단계만 보면 table lock과 같은 효과이고, 충돌이 잦을 때는 재작업과 backoff 때문에 lock보다 오히려 느릴 수 있습니다.
+1. **당시 "table lock" 현상의 정체**: Iceberg는 lock을 쓰지 않고 낙관적 동시성 제어(OCC)로 동작합니다. 한 테이블의 커밋은 한 번에 하나씩만 반영되며, 경쟁에서 진 writer는 재시도합니다. 커넥터를 **몇 초마다, 테이블당 최대 8개 writer에서** 커밋하도록 만든 것이 원인이었고, 그 결과 재시도가 폭주했습니다. 커밋 단계만 보면 table lock과 같은 효과이고, 충돌이 잦을 때는 재작업과 backoff 때문에 lock보다 오히려 느릴 수 있습니다.
 2. **row lock은 Iceberg 공통 스펙이 아닙니다**: Databricks가 발표한 row-level concurrency는 Delta Lake 기능입니다. 이 기능도 커밋 직렬화를 없애지 않고, 충돌을 행 단위로 판정해 **실패를 줄여 줄 뿐**입니다. Iceberg v3(deletion vector, row lineage)도 커밋 모델은 그대로입니다.
-3. **커밋을 묶어도 변경 이력은 사라지지 않습니다**: 지금도 한 배치 안의 중간 변경은 mirror 테이블에서 사라집니다. 변경 이력은 스냅샷이 아니라 log 테이블의 **행**으로 보존해야 하며, 현재 log 테이블은 이미 그렇게 설계되어 있습니다.
+3. **커밋을 묶어도 변경 이력은 사라지지 않습니다**: 중간 변경 이력을 잃지 않으려고 커밋을 자주 하도록 설계했지만, 커밋을 자주 해도 한 배치 안의 중간 변경은 mirror 테이블에서 사라졌습니다. 변경 이력은 스냅샷이 아니라 log 테이블의 **행**으로 보존해야 하며, log 테이블은 처음부터 그렇게 설계해 두었습니다.
 4. **처리량과 커밋 빈도는 별개입니다**: 대용량 적재의 표준은 **병렬 writer + 테이블당 단일 committer + 1~5분 커밋**입니다. 커밋 직렬화가 정하는 것은 데이터 최신성의 하한이지 처리량이 아닙니다.
-5. **최적화가 감당이 안 됐던 이유**: 파일 수는 커밋 횟수에 비례하므로 커밋을 묶으면 크게 줄어듭니다. 하지만 근본 원인은 **equality delete가 파티션 없는 mirror 테이블 전체에 걸리는 것**이라, bucket 파티션이나 MERGE 구조 전환과 증분 컴팩션 운영이 함께 필요합니다.
-6. **삭제 방식은 테이블 성격에 맞춰 고릅니다**: equality delete는 쓰기가 빠른 대신 읽기와 컴팩션 비용이 크고, position delete(v3에서는 deletion vector)와 copy-on-write는 쓰기 시점에 비용을 더 냅니다. 현재 커넥터는 신규 insert에도 equality delete를 쓰고 있어, log 테이블에서는 대부분 불필요한 비용입니다.
-7. **직접 구현한 이유는 당시 공식 커넥터의 공백이었습니다**: 2023년 8월에는 MongoDB 이벤트와 사내 이벤트 모델을 받아 주는 공식 커넥터가 없어, getindata 커넥터를 참고해 직접 만들었습니다. 그때 `put()`마다 커밋하는 구조를 함께 물려받았고, 공식 커넥터의 **테이블당 단일 committer**가 빠졌습니다. Apache 공식 커넥터는 지금도 upsert를 지원하지 않습니다.
+5. **최적화가 감당이 안 됐던 이유**: 파일 수는 커밋 횟수에 비례하므로 커밋을 묶으면 크게 줄어듭니다. 하지만 근본 원인은 **equality delete가 파티션 없는 mirror 테이블 전체에 걸리는 것**이었으므로, bucket 파티션이나 MERGE 구조 전환과 증분 컴팩션 운영이 함께 필요했습니다.
+6. **삭제 방식은 테이블 성격에 맞춰 고릅니다**: equality delete는 쓰기가 빠른 대신 읽기와 컴팩션 비용이 크고, position delete(v3에서는 deletion vector)와 copy-on-write는 쓰기 시점에 비용을 더 냅니다. 제 커넥터는 신규 insert에도 equality delete를 썼고, log 테이블에서는 대부분 불필요한 비용이었습니다.
+7. **직접 구현한 이유는 당시 공식 커넥터의 공백이었습니다**: 2023년 8월에는 MongoDB 이벤트와 사내 이벤트 모델을 받아 주는 공식 커넥터가 없어, getindata 커넥터를 참고해 직접 만들었습니다. 그때 `put()`마다 커밋하는 구조를 함께 가져왔고, 공식 커넥터의 **테이블당 단일 committer**가 빠졌습니다. Apache 공식 커넥터는 지금도 upsert를 지원하지 않습니다.
+8. **실제로 적용한 것은 구조 전환입니다**: 커넥터를 고치는 대신 [buffer sink 커넥터 + Spark 배치 구조](/2026/10/15/buffer-writer-batch-review.html)로 바꿨습니다. 테이블당 커밋 주체는 최대 8개 task에서 배치 job 1개로, 커밋은 몇 초마다에서 10분에 테이블당 2~3회로 줄었고, equality delete는 0이 되었습니다. "append 먼저, merge는 나중에" 권장안은 이 전환으로 실현했습니다. bucket 파티션과 증분 컴팩션은 적용하지 않았고, mirror는 deletion vector 대신 copy-on-write `MERGE`로 적재합니다. 그 대가로 최신성은 수 초에서 15~25분으로 늘었습니다.
 
 </div>
 
@@ -28,7 +32,7 @@ MongoDB CDC 이벤트를 Kafka에서 Iceberg로 적재하던 자체 개발 Sink 
 
 ### 목차
 
-1. [기존 커넥터 평가](#code)
+1. [제가 만든 커넥터 돌아보기](#code)
 2. [table lock과 row lock의 실체](#lock)
 3. [커밋을 묶으면 변경 이력이 사라지는가](#history)
 4. [Databricks row-level concurrency와 Iceberg의 차이](#databricks)
@@ -42,11 +46,11 @@ MongoDB CDC 이벤트를 Kafka에서 Iceberg로 적재하던 자체 개발 Sink 
 
 </div>
 
-## 1. 기존 커넥터 평가 {#code}
+## 1. 제가 만든 커넥터 돌아보기 {#code}
 
-커넥터는 `put()`이 호출될 때마다(poll 1회, 최대 3000건) 레코드를 테이블별로 묶어 writer로 쓰고, 그 자리에서 `rowDelta.commit()`을 호출합니다. upsert 모드에서는 `BaseEqualityDeltaWriter`로 equality delete를 함께 씁니다.
+제가 만든 커넥터는 `put()`이 호출될 때마다(poll 1회, 최대 3000건) 레코드를 테이블별로 묶어 writer로 쓰고, 그 자리에서 `rowDelta.commit()`을 호출했습니다. upsert 모드에서는 `BaseEqualityDeltaWriter`로 equality delete를 함께 썼습니다.
 
-### 운영 설정에서 확인된 구조
+### 운영 설정
 
 <div class="table-wrap" markdown="1">
 
@@ -61,7 +65,7 @@ MongoDB CDC 이벤트를 Kafka에서 Iceberg로 적재하던 자체 개발 Sink 
 
 > **major mirror 테이블 4종은 writer가 최대 8개**
 >
-> upsert-major(3)와 snapshot(5) 커넥터가 같은 `cdc_mirror_major_*` 테이블에 각자 몇 초 간격으로 커밋합니다. 커밋 경합이 가장 심했던 지점입니다.
+> upsert-major(3)와 snapshot(5) 커넥터가 같은 `cdc_mirror_major_*` 테이블에 각자 몇 초 간격으로 커밋했습니다. 커밋 경합이 가장 심했던 지점입니다.
 {: .callout .warn}
 
 ### 성능 문제
@@ -70,29 +74,33 @@ MongoDB CDC 이벤트를 Kafka에서 Iceberg로 적재하던 자체 개발 Sink 
 
 | 위치 | 내용 |
 | --- | --- |
-| 적재 유틸의 커밋 호출 | `put()`마다 테이블별로 즉시 커밋합니다. 커밋이 몇 초 간격으로 일어납니다. |
-| `tasks.max=3` + `topics.regex` | 한 토픽의 파티션이 여러 task에 나뉘어, 같은 테이블에 task 3개가 동시에 커밋합니다. |
-| 적재 유틸의 스키마 처리 | 스키마 비교를 레코드마다 하고, 스키마 확장도 별도 커밋이라 경합을 키웁니다. |
-| sink task의 `put()` | 매 `put()`마다 `loadTable`을 호출해 Glue GetTable과 metadata.json 읽기를 반복합니다. |
-| MOR + equality delete | 커밋마다 작은 data/delete/manifest 파일이 생깁니다. 컴팩션이 없으면 커밋과 읽기가 함께 느려집니다. |
+| 적재 유틸의 커밋 호출 | `put()`마다 테이블별로 즉시 커밋하도록 만들었습니다. 커밋이 몇 초 간격으로 일어났습니다. |
+| `tasks.max=3` + `topics.regex` | 한 토픽의 파티션이 여러 task에 나뉘어, 같은 테이블에 task 3개가 동시에 커밋했습니다. |
+| 적재 유틸의 스키마 처리 | 스키마 비교를 레코드마다 했고, 스키마 확장도 별도 커밋이라 경합을 키웠습니다. |
+| sink task의 `put()` | 매 `put()`마다 `loadTable`을 호출해 Glue GetTable과 metadata.json 읽기를 반복했습니다. |
+| MOR + equality delete | 커밋마다 작은 data/delete/manifest 파일이 생겼습니다. 컴팩션이 따라가지 못하면 커밋과 읽기가 함께 느려졌습니다. |
 
 </div>
 
-### 그 밖의 평가
+상태: 커넥터 코드에서 이 항목들을 하나씩 고치지 않고, 적재 구조를 buffer + Spark 배치로 전환해 커밋 경합과 equality delete 누적을 함께 없앴습니다. 전환 후 테이블당 커밋 주체는 배치 job 1개, 커밋은 10분에 테이블당 2~3회입니다(9장).
 
-- <span class="pill ok">양호</span> 같은 배치 안의 중복 키를 position delete로 올바르게 처리합니다.
-- <span class="pill ok">양호</span> 실패 시 예외로 offset 커밋을 막아 at-least-once를 보장하고, upsert라 재처리해도 결과가 같습니다.
-- <span class="pill warn">개선</span> 실패 시 writer를 `abort()`하지 않아 orphan 파일이 남습니다.
-- <span class="pill warn">개선</span> 한 `put()`에서 여러 테이블 커밋이 원자적이지 않습니다. upsert 테이블은 괜찮지만 append 계열은 확인이 필요합니다.
-- <span class="pill warn">개선</span> `RuntimeException`을 던지면 task가 FAILED로 멈춥니다. `errors.retry.timeout`은 converter와 SMT에만 적용되고 `put()`에는 적용되지 않습니다.
-- <span class="pill warn">개선</span> `iceberg-spark-runtime`을 통째로 포함해 jar가 무겁습니다. Iceberg 1.4.3도 오래된 버전입니다.
+### 그 밖에 돌아본 점
+
+- <span class="pill ok">양호</span> 같은 배치 안의 중복 키를 position delete로 올바르게 처리했습니다.
+- <span class="pill ok">양호</span> 실패 시 예외로 offset 커밋을 막아 at-least-once를 보장했고, upsert라 재처리해도 결과가 같았습니다.
+- <span class="pill warn">개선</span> 실패 시 writer를 `abort()`하지 않도록 만들어 orphan 파일이 남았습니다.
+- <span class="pill warn">개선</span> 한 `put()`에서 여러 테이블 커밋이 원자적이지 않았습니다. 네 커넥터 모두 upsert 키(log는 `_oid, __source_ts_ms_ord`)를 두었으므로 재처리하면 결과가 같아지지만, 실패 직후에는 일부 테이블만 반영된 상태가 보일 수 있었습니다.
+- <span class="pill warn">개선</span> `RuntimeException`을 던지면 task가 FAILED로 멈췄습니다. `errors.retry.timeout`은 converter와 SMT에만 적용되고 `put()`에는 적용되지 않습니다.
+- <span class="pill warn">개선</span> `iceberg-spark-runtime`을 통째로 포함해 jar가 무거웠습니다. Iceberg 1.4.3도 오래된 버전입니다.
+
+상태: 이 항목들은 커넥터에서 고치지 않았습니다. 커넥터는 2024-12에 archive했고, 적재를 buffer + Spark 배치 구조로 옮겼습니다. 그중 반쪽 파일 문제는 전환 후 buffer writer가 업로드 실패 시 multipart upload를 abort하는 방식으로 다뤘습니다.
 
 ## 2. table lock과 row lock의 실체 {#lock}
 
-**질문** 당시 table lock 때문에 적재가 느렸는데, 요즘은 Iceberg가 row lock으로 처리한다고 들었다. 개선이 가능한가?
+**당시 가정** 적재가 느린 원인을 table lock으로 봤습니다. 그리고 "Iceberg도 이제 row lock으로 동시 커밋을 처리한다"는 이야기가 있었으므로, lock 문제를 버전 업그레이드로 풀 수 있다고 봤습니다.
 {: .q}
 
-Iceberg는 처음부터 lock을 쓰지 않습니다. 데이터 파일과 메타데이터를 먼저 쓰고, 마지막에 카탈로그(Glue)의 metadata 포인터를 원자적으로 교체하는 방식으로 커밋합니다.
+**확인한 사실** Iceberg는 처음부터 lock을 쓰지 않습니다. 데이터 파일과 메타데이터를 먼저 쓰고, 마지막에 카탈로그(Glue)의 metadata 포인터를 원자적으로 교체하는 방식으로 커밋합니다.
 
 ```
 writer A: [데이터 파일 쓰기]──┐ commit(base=v10 → v11)  성공
@@ -102,7 +110,7 @@ writer B: [데이터 파일 쓰기]──┴ commit(base=v10 → v11)  실패: �
 
 - 데이터 파일 쓰기는 완전히 병렬로 일어납니다.
 - 커밋 순간만 직렬화됩니다. 경쟁에서 진 쪽은 실패로 끝나지 않고 자동으로 재시도합니다(`commit.retry.num-retries`, 지수 backoff).
-- 이 커넥터의 `RowDelta`는 충돌 검증을 하지 않으므로 데이터 충돌로 실패한 적은 없습니다. 원인은 순수하게 **커밋 순번을 잡기 위한 재시도 폭주**였습니다. 재시도할 때마다 메타데이터 재로딩, manifest 재작성, backoff 대기가 반복되어 task가 멈춘 것처럼 보였습니다.
+- 제 커넥터의 `RowDelta`는 충돌 검증을 하지 않았으므로 데이터 충돌로 실패한 적은 없습니다. 원인은 순수하게 **커밋 순번을 잡기 위한 재시도 폭주**였습니다. 재시도할 때마다 메타데이터 재로딩, manifest 재작성, backoff 대기가 반복되어 task가 멈춘 것처럼 보였습니다.
 
 ### 낙관적 동시성 제어(OCC)란
 
@@ -137,14 +145,14 @@ writer B: [데이터 파일 쓰기]──┴ commit(base=v10 → v11)  실패: �
 
 </div>
 
-일반적인 OCC 설명에서는 "충돌 시 애플리케이션이 재시도를 직접 구현해야 한다"고 하지만, Iceberg는 커밋 재시도를 라이브러리가 대신 해 줍니다. 대신 보호 대상이 테이블 포인터 하나뿐이라, **같은 테이블에 커밋하는 모든 writer가 같은 대상을 두고 다툽니다.** OCC가 피해야 하는 환경으로 꼽는 "많은 트랜잭션이 같은 대상을 짧은 간격으로 다투는 경우"가 바로 이 커넥터의 상황이었습니다.
+일반적인 OCC 설명에서는 "충돌 시 애플리케이션이 재시도를 직접 구현해야 한다"고 하지만, Iceberg는 커밋 재시도를 라이브러리가 대신 해 줍니다. 대신 보호 대상이 테이블 포인터 하나뿐이라, **같은 테이블에 커밋하는 모든 writer가 같은 대상을 두고 다툽니다.** OCC가 피해야 하는 환경으로 꼽는 "많은 트랜잭션이 같은 대상을 짧은 간격으로 다투는 경우"가 바로 제가 만든 커넥터의 상황이었습니다.
 
 ### 그렇다면 결국 table lock 효과가 아닌가
 
-**질문** table lock이 아니라 테이블 단위 커밋 경합이라고 했지만, 결국 table lock의 효과를 내는 것 아닌가?
+**당시 가정** table lock이 아니라 테이블 단위 커밋 경합이라 해도 결국 table lock과 같은 효과이므로, 이름만 다를 뿐 대응도 같다고 봤습니다.
 {: .q}
 
-결과만 보면 맞습니다. 커밋 단계만 놓고 보면 테이블 단위 lock과 같은 효과가 납니다. 한 테이블에 동시에 반영될 수 있는 커밋은 하나뿐이고, 나머지는 기다렸다가 다시 해야 합니다. 체감 현상을 "table lock 때문에 느리다"고 표현해도 틀리지 않습니다. 다만 동작 방식이 달라서 대응 방법도 달라집니다.
+**확인한 사실** 결과만 보면 같은 효과가 맞습니다. 커밋 단계만 놓고 보면 테이블 단위 lock과 같은 효과가 납니다. 한 테이블에 동시에 반영될 수 있는 커밋은 하나뿐이고, 나머지는 기다렸다가 다시 해야 합니다. 체감 현상을 "table lock 때문에 느리다"고 표현해도 틀리지 않습니다. 다만 동작 방식이 달라서 대응 방법도 달라집니다.
 
 <div class="table-wrap" markdown="1">
 
@@ -175,18 +183,18 @@ writer B: [데이터 파일 쓰기]──┴ commit(base=v10 → v11)  실패: �
 
 - **Deletion Vectors**: position delete를 데이터 파일당 bitmap(Puffin) 하나로 관리합니다. 삭제를 쓰고 읽는 효율이 좋아집니다.
 - **Row Lineage**: `_row_id`, `_last_updated_sequence_number`로 행 단위 변경을 추적합니다.
-- 커밋은 여전히 테이블 단위 OCC이고, 충돌 검사는 파일과 스냅샷 단위입니다. 이 커넥터의 upsert는 equality delete를 쓰므로 deletion vector의 이점도 제한적입니다.
+- 커밋은 여전히 테이블 단위 OCC이고, 충돌 검사는 파일과 스냅샷 단위입니다. 제 커넥터의 upsert는 equality delete를 썼으므로 v3로 올렸어도 deletion vector의 이점은 제한적이었을 것입니다.
 
 ## 3. 커밋을 묶으면 변경 이력이 사라지는가 {#history}
 
-**질문** 커밋을 묶으면 변경 이력이 커밋 단위로만 남아 중간 변경이 사라지지 않나? 그래서 커밋을 자주 했다.
+**당시 가정** 커밋을 묶으면 변경 이력이 커밋 단위로만 남아 중간 변경이 사라진다고 봤습니다. 그래서 중간 변경 이력을 잃지 않으려고 커밋을 자주 하도록 설계했습니다.
 {: .q}
 
-Iceberg 스냅샷 이력이 커밋 단위로만 남는 것은 맞습니다. 하지만 지금 구조에서는 커밋을 자주 해도 그 이력이 보존되지 않습니다.
+**확인한 사실** Iceberg 스냅샷 이력이 커밋 단위로만 남는 것은 맞습니다. 하지만 제가 만든 구조에서는 커밋을 자주 해도 그 이력이 보존되지 않았습니다.
 
-### 지금도 배치 안의 중간 변경은 사라집니다
+### 커밋을 자주 해도 배치 안의 중간 변경은 사라졌습니다
 
-delta writer는 upsert일 때 `delete(record)` 후 `write(record)`를 호출합니다. `BaseEqualityDeltaWriter`는 같은 writer 안에서 이미 insert한 키가 다시 오면 이전 행을 position delete로 지웁니다.
+delta writer는 upsert일 때 `delete(record)` 후 `write(record)`를 호출했습니다. `BaseEqualityDeltaWriter`는 같은 writer 안에서 이미 insert한 키가 다시 오면 이전 행을 position delete로 지웁니다.
 
 ```
 같은 put() 안: _oid=A  v1 → v2 → v3
@@ -195,11 +203,11 @@ mirror 테이블:  v3만 남음 (v1, v2는 같은 커밋 안에서 삭제)
 ```
 
 - mirror 테이블의 스냅샷 이력은 변경 이력이 아니라 **poll 배치 단위로 샘플링한 상태**입니다. 커밋 주기를 늘리면 샘플링 간격이 넓어질 뿐입니다.
-- snapshot 커넥터는 `history.expire.max-snapshot-age-ms=86400000`(1일)으로 스냅샷을 지우고 있어, 스냅샷은 애초에 이력 저장소로 쓰이지 않고 있습니다.
+- snapshot 커넥터는 `history.expire.max-snapshot-age-ms=86400000`(1일)으로 스냅샷을 지우도록 설정해 두었으므로, 스냅샷은 애초에 이력 저장소로 쓰이지 않았습니다.
 
 ### 변경 이력은 log 테이블이 행으로 보존합니다
 
-`cdc_log_*`는 키에 `__source_ts_ms_ord`가 들어 있어 변경 하나하나가 서로 다른 행이 됩니다. 커밋을 1분이든 10분이든으로 묶어도 사라지는 변경이 없고, 스냅샷 만료나 컴팩션과도 무관합니다.
+`cdc_log_*`는 키에 `__source_ts_ms_ord`를 넣어 변경 하나하나가 서로 다른 행이 되도록 설계했습니다. 커밋을 1분이든 10분이든으로 묶어도 사라지는 변경이 없고, 스냅샷 만료나 컴팩션과도 무관합니다.
 
 <div class="table-wrap" markdown="1">
 
@@ -212,17 +220,17 @@ mirror 테이블:  v3만 남음 (v1, v2는 같은 커밋 안에서 삭제)
 
 ### 커밋을 묶을 때 주의할 점
 
-- **메모리**: writer를 오래 열어 두면 `insertedRowMap`이 커밋 전까지 모든 키를 메모리에 들고 있습니다. 시간 조건과 건수 조건을 함께 거세요.
-- **가시성 지연**: 커밋 주기만큼 쿼리에 늦게 보입니다. 하위 소비자의 SLA에 맞춰 주기를 정하세요.
+- **메모리**: writer를 오래 열어 두면 `insertedRowMap`이 커밋 전까지 모든 키를 메모리에 들고 있습니다. 시간 조건과 건수 조건을 함께 걸어야 합니다.
+- **가시성 지연**: 커밋 주기만큼 쿼리에 늦게 보입니다. 주기는 하위 소비자의 SLA에 맞춰 정해야 합니다.
 - **offset 정합성**: `preCommit()`에서 Iceberg 커밋에 성공한 offset만 반환해야 합니다.
-- **키 유일성**: `__source_ts_ms_ord`가 같은 `_oid` 안에서 정말 유일해야 이력이 보장됩니다. converter에서 확인이 필요합니다.
+- **키 유일성**: `__source_ts_ms_ord`가 같은 `_oid` 안에서 유일해야 이력이 보장됩니다. 그런데 제가 만든 `ts_ms + ord` 계산은 같은 초 안에서 ord가 1000을 넘으면 값이 겹칩니다. 전환 후 배치에도 같은 계산이 남아 있어, Buffer Writer 리뷰의 S3 항목으로 수정안을 정리했습니다(미적용).
 
 ## 4. Databricks row-level concurrency와 Iceberg의 차이 {#databricks}
 
-**질문** Databricks 발표에서 row 단위로 처리할 수 있다고 해서 Iceberg 공통 스펙인 줄 알았다. Iceberg 공식으로는 아직 테이블 단위 동시 커밋이 불가능한가?
+**당시 가정** Databricks 발표의 row 단위 동시성 처리를 Iceberg 공통 스펙으로 보고, Iceberg 공식 스펙에서도 테이블 단위 커밋 제약이 풀렸을 것이라는 가정이 있었습니다.
 {: .q}
 
-Databricks의 row-level concurrency는 **Delta Lake 테이블 기능**입니다(DBR 14.3+, deletion vectors 활성화, 파티션 없는 테이블). 문서에 managed Iceberg 테이블에 적용된다는 내용은 없습니다. 그리고 Delta도 커밋은 테이블당 한 번에 하나입니다. `_delta_log`에 다음 버전 파일을 먼저 만든 쪽이 이깁니다.
+**확인한 사실** Databricks의 row-level concurrency는 **Delta Lake 테이블 기능**입니다(DBR 14.3+, deletion vectors 활성화, 파티션 없는 테이블). 문서에 managed Iceberg 테이블에 적용된다는 내용은 없습니다. 그리고 Delta도 커밋은 테이블당 한 번에 하나입니다. `_delta_log`에 다음 버전 파일을 먼저 만든 쪽이 이깁니다.
 
 <div class="table-wrap" markdown="1">
 
@@ -236,15 +244,15 @@ Databricks의 row-level concurrency는 **Delta Lake 테이블 기능**입니다(
 
 > **정리**
 >
-> row-level concurrency는 MERGE/UPDATE끼리 같은 파일을 건드려 생기는 **실패**를 줄이는 기능이지, 커밋 직렬화를 없애는 기능이 아닙니다. 이 커넥터는 데이터 충돌이 아니라 커밋 순번 경쟁이 문제였으므로, Delta로 옮겼어도 같은 증상이 났을 것입니다. 해법은 포맷과 상관없이 **커밋 횟수와 테이블당 커밋 주체 수를 줄이는 것**입니다.
+> row-level concurrency는 MERGE/UPDATE끼리 같은 파일을 건드려 생기는 **실패**를 줄이는 기능이지, 커밋 직렬화를 없애는 기능이 아닙니다. 제 커넥터는 데이터 충돌이 아니라 커밋 순번 경쟁이 문제였으므로, Delta로 옮겼어도 같은 증상이 났을 것입니다. 해법은 포맷과 상관없이 **커밋 횟수와 테이블당 커밋 주체 수를 줄이는 것**입니다.
 {: .callout .info}
 
 ## 5. 대용량 실시간 적재 권장 방식 {#scale}
 
-**질문** 테이블 단위 커밋 lock이 있는 이상 Iceberg는 대량 데이터의 빠른 적재와 거리가 있지 않나? 더 나은 권장 방식이 있나?
+**당시 가정** 테이블 단위 커밋 직렬화가 있는 이상 Iceberg는 대량 데이터를 빠르게 적재하는 데 맞지 않는다고 봤습니다.
 {: .q}
 
-커밋은 데이터를 쓰는 단계가 아니라, 이미 써 둔 파일 목록을 메타데이터에 등록하는 단계입니다. 그래서 커밋 직렬화는 처리량이 아니라 **최신성의 하한**을 정합니다.
+**확인한 사실** 커밋은 데이터를 쓰는 단계가 아니라, 이미 써 둔 파일 목록을 메타데이터에 등록하는 단계입니다. 그래서 커밋 직렬화는 처리량이 아니라 **최신성의 하한**을 정합니다.
 
 ```
 [Kafka 파티션 1..N] → [writer 1..N: Parquet 병렬 쓰기]    ← 처리량 결정 (수평 확장)
@@ -254,7 +262,7 @@ Databricks의 row-level concurrency는 **Delta Lake 테이블 기능**입니다(
 
 - 1분에 한 번 커밋해도 그 한 번에 수천만 건(수 GB)을 등록할 수 있습니다. writer를 늘리면 처리량이 늘고 커밋 횟수는 그대로입니다.
 - lock은 테이블 단위라 컬렉션별 테이블끼리는 커밋이 병렬입니다.
-- 기존 커넥터는 writer마다 각자 몇 초 간격으로 커밋해서, 처리량이 커밋 경쟁에 묶였습니다.
+- 제가 만든 커넥터는 writer마다 각자 몇 초 간격으로 커밋하도록 되어 있어, 처리량이 커밋 경쟁에 묶였습니다.
 
 ### 병렬 writer + 단일 committer 구현체
 
@@ -272,7 +280,7 @@ Databricks의 row-level concurrency는 **Delta Lake 테이블 기능**입니다(
 
 > **공식 Kafka Connect Sink 도입 전 확인**
 >
-> 원본인 Tabular 버전은 upsert 모드를 명시적으로 지원했지만, Apache 버전은 기증 과정에서 upsert가 빠졌고 최신 문서에도 설정 키가 없습니다(2026-10 확인). 그래서 Apache 버전은 append 테이블에만 씁니다. 자세한 차이는 8장에 있습니다.
+> 원본인 Tabular 버전은 upsert 모드를 명시적으로 지원했지만, Apache 버전은 기증 과정에서 upsert가 빠졌고 최신 문서에도 설정 키가 없습니다(2026-10 확인). 그래서 Apache 버전은 append 테이블에만 쓸 수 있습니다. 자세한 차이는 8장에 있습니다.
 {: .callout .warn}
 
 ### 공식 Kafka Connect Sink 관련 링크
@@ -288,17 +296,17 @@ Databricks의 row-level concurrency는 **Delta Lake 테이블 기능**입니다(
 
 </div>
 
-두 버전은 커넥터 클래스 이름(`org.apache.iceberg.connect.IcebergSinkConnector`와 `io.tabular.iceberg.connect.IcebergSinkConnector`)과 설정 키가 일부 다릅니다. 인터넷의 예제를 참고할 때는 어느 버전 기준인지 확인하세요. 새로 도입한다면 Apache 버전을 기준으로 합니다.
+두 버전은 커넥터 클래스 이름(`org.apache.iceberg.connect.IcebergSinkConnector`와 `io.tabular.iceberg.connect.IcebergSinkConnector`)과 설정 키가 일부 다릅니다. 인터넷의 예제는 어느 버전 기준인지부터 가려서 봐야 합니다. 새로 도입한다면 Apache 버전을 기준으로 하는 것이 맞다고 판단했습니다.
 
 ### CDC(upsert) 권장 패턴
 
 1. **Append 먼저, Merge는 나중에** (가장 일반적): Kafka에서 변경 로그 테이블로 append하고 1~5분마다 커밋합니다. mirror 테이블은 Spark나 Databricks의 `MERGE INTO` 단일 job으로 5~15분마다 반영합니다.
 2. **Flink upsert sink + 주기적 컴팩션**: 분 단위 최신성이 필요할 때 씁니다. equality delete가 쌓이므로 컴팩션이 필수입니다.
-3. **테이블 유지보수 자동화**: `rewrite_data_files`, `rewrite_position_delete_files`, `expire_snapshots`, `rewrite_manifests`. Glue와 S3 Tables의 자동 컴팩션이나 Databricks Predictive Optimization을 활용할 수 있습니다. 컴팩션도 커밋이므로 `partial-progress.enabled`를 켜고 실행 간격을 조율하세요.
+3. **테이블 유지보수 자동화**: `rewrite_data_files`, `rewrite_position_delete_files`, `expire_snapshots`, `rewrite_manifests`. Glue와 S3 Tables의 자동 컴팩션이나 Databricks Predictive Optimization을 활용할 수 있습니다. 컴팩션도 커밋이므로 `partial-progress.enabled`를 켜고 실행 간격을 조율해야 합니다.
 
 ### 초 단위 최신성이 필요하다면
 
-Iceberg는 분 단위의 근실시간 분석 저장소입니다. 초 단위 upsert 최신성이 필요하면 다른 계층을 함께 검토합니다. 제품마다 성숙도 차이가 크니 PoC로 검증하세요.
+Iceberg는 분 단위의 근실시간 분석 저장소입니다. 초 단위 upsert 최신성이 필요하면 다른 계층을 함께 검토해야 합니다. 제품마다 성숙도 차이가 커서 PoC로 검증하는 편이 낫습니다.
 
 - **Apache Paimon**: LSM 트리 기반으로, Flink에서 primary key upsert를 고빈도로 처리하도록 설계됐습니다.
 - **Apache Hudi 1.x**: MOR 테이블에서 여러 writer가 동시에 쓰는 non-blocking concurrency control을 지원합니다.
@@ -321,14 +329,14 @@ Iceberg 행 단위 삭제
 - **동작**: 삭제할 행의 키 값만 equality delete 파일에 기록합니다. 대상 행이 어느 파일에 있는지 찾지 않습니다.
 - **장점**: 사전 스캔이 없어 쓰기와 커밋 지연이 짧습니다. 스트리밍 CDC에 맞는 방식입니다.
 - **단점**: 조회할 때 data 파일마다 해당 equality delete의 키 집합과 대조해야 해서 읽기 부하가 큽니다. 컴팩션으로 data 파일에 반영하기 전까지 비용이 계속 쌓입니다.
-- **주요 사용처**: Flink upsert sink, Kafka Connect upsert 같은 실시간 CDC 적재. 이 커넥터가 쓰는 방식입니다.
+- **주요 사용처**: Flink upsert sink, Kafka Connect upsert 같은 실시간 CDC 적재. 제 커넥터가 쓴 방식입니다.
 
 ### Position delete
 
 - **동작**: 삭제할 행의 정확한 위치 `(file_path, row_position)`를 기록합니다.
 - **장점**: 조회 시 해당 파일의 특정 행만 건너뛰면 되므로 equality delete보다 읽기 저하가 훨씬 적습니다.
 - **단점**: 기록 전에 대상 행이 어느 파일의 몇 번째 행인지 찾는 스캔이 필요합니다.
-- **주요 사용처**: Spark, Trino의 `MERGE`/`UPDATE`/`DELETE` (MoR 모드). 같은 writer가 방금 쓴 행을 다시 지울 때도 쓰입니다(이 커넥터의 배치 내 중복 처리).
+- **주요 사용처**: Spark, Trino의 `MERGE`/`UPDATE`/`DELETE` (MoR 모드). 같은 writer가 방금 쓴 행을 다시 지울 때도 쓰입니다(제 커넥터의 배치 내 중복 처리).
 
 ### Copy-on-Write
 
@@ -361,22 +369,24 @@ Iceberg 행 단위 삭제
 - **v3의 deletion vector는 position delete만 대체합니다.** equality delete는 v3에서도 그대로이고, 커뮤니티는 v4에서 equality delete를 줄이는 방향을 논의하고 있습니다. 스트리밍 upsert를 계속 equality delete로 하면 v3로 올려도 이 부분의 비용은 같습니다.
 - **"쓰기 비용이 낮다"는 커밋 1회 기준입니다.** 읽기와 컴팩션에서 나중에 치르는 비용까지 합치면, 업데이트가 많은 테이블에서는 equality delete가 가장 비싼 방식이 될 수 있습니다.
 
-### 이 커넥터에 대입하면
+### 제 커넥터에 대입하면
 
-delta writer의 `write()`는 upsert 모드에서 operation 종류와 상관없이 항상 `delete(record)`를 먼저 호출합니다. 신규 insert에도 equality delete 행이 하나씩 생깁니다.
+delta writer의 `write()`는 upsert 모드에서 operation 종류와 상관없이 항상 `delete(record)`를 먼저 호출하도록 만들었습니다(8장 R1). 그래서 신규 insert에도 equality delete 행이 하나씩 생겼습니다.
 
 <div class="table-wrap" markdown="1">
 
-| 테이블 | 현재 삭제 방식 | 평가 |
+| 테이블 | 당시 삭제 방식 | 돌아보면 |
 | --- | --- | --- |
-| `cdc_mirror_*` | equality delete + 배치 내 중복은 position delete | 최신 상태 유지에 필요하지만, 파티션이 없어 영향 범위가 테이블 전체 |
-| `cdc_log_*` | equality delete (키에 `__source_ts_ms_ord` 포함) | 키가 매 변경마다 달라서 지울 대상이 거의 없습니다. 재처리 시 중복 방지 역할만 하는, **대부분 불필요한 비용**입니다. |
+| `cdc_mirror_*` | equality delete + 배치 내 중복은 position delete | 최신 상태 유지에 필요했지만, 파티션이 없어 영향 범위가 테이블 전체였습니다 |
+| `cdc_log_*` | equality delete (키에 `__source_ts_ms_ord` 포함) | 키가 매 변경마다 달라서 지울 대상이 거의 없었습니다. 재처리 시 중복 방지 역할만 하는, **대부분 불필요한 비용**이었습니다. |
 
 </div>
 
 > **log 테이블 개선 선택지**
 >
 > exactly-once 적재(공식 Iceberg Kafka Connect Sink 등)로 바꾸면 재처리 중복이 생기지 않으므로 log 테이블을 순수 append(`upsert=false`)로 둘 수 있습니다. at-least-once를 유지해야 한다면 append로 쓰고 조회나 MERGE 단계에서 `(_oid, __source_ts_ms_ord)`로 중복을 제거하는 방식이 equality delete보다 저렴합니다.
+>
+> 상태: 전환 후 log 테이블은 append(파티션 단위 덮어쓰기)로 적재하며 equality delete는 0입니다. 재처리 중복은 결정적 버퍼 파일명과 `overwritePartitions`로 막았습니다.
 {: .callout .info}
 
 ### 테이블 성격별 권장
@@ -394,10 +404,10 @@ delta writer의 `write()`는 upsert 모드에서 operation 종류와 상관없�
 
 ## 7. 테이블 운영 최적화 {#ops}
 
-**질문** upsert로 삭제와 추가를 반복하고 매번 커밋해서 파일이 많고, 주기적으로 최적화를 돌려도 감당이 안 됐다. 커밋을 줄이면 같이 해결되는가, 아니면 최적화를 실행하는 더 나은 방식이 있는가?
+**당시 가정** upsert로 삭제와 추가를 반복하며 매번 커밋해 파일이 늘어도, 주기적으로 최적화를 돌리면 감당할 수 있다고 봤습니다. 실제로는 최적화가 파일 증가를 따라가지 못했습니다.
 {: .q}
 
-커밋을 줄이면 상당 부분 해결되지만 전부는 아닙니다. 파일 개수는 커밋 횟수에 비례해 줄어듭니다. 하지만 최적화 범위가 넓어지는 근본 원인은 equality delete가 파티션 없는 mirror 테이블 전체에 걸린다는 점이라, 구조도 함께 바꿔야 합니다.
+**확인한 사실** 커밋을 줄이면 상당 부분 해결되지만 전부는 아닙니다. 파일 개수는 커밋 횟수에 비례해 줄어듭니다. 하지만 최적화 범위가 넓어지는 근본 원인은 equality delete가 파티션 없는 mirror 테이블 전체에 걸린다는 점이라, 구조도 함께 바꿔야 합니다.
 
 ### 파일이 폭증하고 최적화가 감당이 안 되는 이유
 
@@ -408,7 +418,7 @@ delta writer의 `write()`는 upsert 모드에서 operation 종류와 상관없�
 ```
 
 - **equality delete의 적용 범위가 넓습니다.** 같은 파티션 안에서 자기보다 먼저 들어온 모든 data 파일에 적용됩니다. mirror 테이블은 파티션이 없으므로 테이블 전체가 대상입니다.
-- **컴팩션이 매번 테이블 전체를 다시 씁니다.** equality delete는 `rewrite_data_files`로 data 파일에 반영해야만 없어지는데, 적용 대상이 전체 파일이기 때문입니다. 그동안에도 커넥터는 몇 초마다 새 delete를 쌓습니다.
+- **컴팩션이 매번 테이블 전체를 다시 씁니다.** equality delete는 `rewrite_data_files`로 data 파일에 반영해야만 없어지는데, 적용 대상이 전체 파일이기 때문입니다. 그동안에도 커넥터는 몇 초마다 새 delete를 쌓았습니다.
 - **컴팩션도 커밋이라 커넥터와 경합합니다.** 큰 컴팩션일수록 커밋 직전에 실패할 확률이 높습니다.
 
 ### 커밋을 줄이면 해결되는 것과 안 되는 것
@@ -455,7 +465,7 @@ ADD PARTITION FIELD bucket(16, _oid);
 | 2 | `rewrite_position_delete_files` | position delete 파일 병합, 무효가 된(dangling) delete 제거 |
 | 3 | `rewrite_manifests` | manifest 병합으로 커밋과 쿼리 계획 속도 개선 |
 | 4 | `expire_snapshots` | 오래된 스냅샷과 컴팩션으로 대체된 파일의 실제 삭제 |
-| 5 | `remove_orphan_files` | 실패한 writer가 남긴 고아 파일 정리 (현재 커넥터는 `abort()`가 없어 필요) |
+| 5 | `remove_orphan_files` | 실패한 writer가 남긴 고아 파일 정리 (당시 커넥터는 `abort()`가 없어 필요) |
 
 </div>
 
@@ -464,7 +474,7 @@ ADD PARTITION FIELD bucket(16, _oid);
 > `expire_snapshots`를 하지 않으면 컴팩션을 해도 이전 파일이 S3에 그대로 남습니다.
 {: .callout .warn}
 
-테이블 속성도 함께 정리하세요. 현재는 snapshot 커넥터에만 들어가 있습니다.
+테이블 속성도 함께 정리해야 했습니다. 당시에는 snapshot 커넥터에만 들어가 있었습니다.
 
 ```
 write.metadata.delete-after-commit.enabled = true
@@ -513,11 +523,11 @@ CALL glue.system.remove_orphan_files(
 ```
 
 - **`partial-progress.enabled`는 필수입니다.** 큰 컴팩션을 여러 개의 작은 커밋으로 나눠, 도중에 충돌이 나도 끝난 그룹은 유지됩니다. "감당이 안 됐던" 상황을 완화하는 가장 직접적인 옵션입니다.
-- **스트리밍 writer와의 충돌**: 기본값 `use-starting-sequence-number=true` 덕분에 컴팩션 도중 들어온 equality delete는 새 파일에도 계속 적용되어 충돌하지 않습니다. 충돌은 컴팩션 대상 파일에 position delete가 새로 붙을 때 납니다. 이 커넥터의 position delete는 같은 배치에서 새로 쓴 파일만 가리키므로 충돌이 적은 편입니다.
-- **주기**: 커밋을 5분 단위로 묶었다면, 테이블별로 1~2시간마다 증분 컴팩션, 하루 1회 스냅샷 만료가 무난합니다. 테이블 크기가 아니라 **delete 파일 비율**을 보고 조정하세요.
-- **실행 환경**: 커넥터와 분리된 Spark job(EMR, Glue ETL, Databricks)으로 테이블별 병렬 실행합니다. AWS Glue Data Catalog의 자동 테이블 최적화를 쓰면 스케줄 관리 부담이 줄지만, MOR 테이블의 equality delete 처리 지원 범위는 사용 중인 버전에서 확인이 필요합니다.
+- **스트리밍 writer와의 충돌**: 기본값 `use-starting-sequence-number=true` 덕분에 컴팩션 도중 들어온 equality delete는 새 파일에도 계속 적용되어 충돌하지 않습니다. 충돌은 컴팩션 대상 파일에 position delete가 새로 붙을 때 납니다. 제 커넥터의 position delete는 같은 배치에서 새로 쓴 파일만 가리켰으므로 충돌이 적은 편이었습니다.
+- **주기**: 커밋을 5분 단위로 묶었다면, 테이블별로 1~2시간마다 증분 컴팩션, 하루 1회 스냅샷 만료가 무난합니다. 테이블 크기가 아니라 **delete 파일 비율**을 보고 조정하는 편이 낫습니다.
+- **실행 환경**: 커넥터와 분리된 Spark job(EMR, Glue ETL, Databricks)으로 테이블별 병렬 실행합니다. AWS Glue Data Catalog의 자동 테이블 최적화를 쓰면 스케줄 관리 부담이 줄지만, MOR 테이블의 equality delete 처리 지원 범위는 이 문서에서 검증하지 못했습니다. 도입한다면 먼저 검증할 항목입니다.
 
-### 현재 상태를 측정하는 쿼리
+### 상태를 측정하는 쿼리
 
 ```sql
 -- content: 0=data, 1=position delete, 2=equality delete
@@ -533,7 +543,7 @@ FROM glue.lake_db.cdc_mirror_xxx.snapshots
 GROUP BY 1 ORDER BY 1 DESC LIMIT 24;
 ```
 
-equality delete 파일(content=2) 수가 data 파일 수에 가깝거나 더 많고 평균 파일 크기가 수 MB 이하라면, 지금 겪은 상황과 정확히 일치합니다.
+equality delete 파일(content=2) 수가 data 파일 수에 가깝거나 더 많고 평균 파일 크기가 수 MB 이하라면, 당시 겪은 상황에 해당합니다.
 
 ### 단계별 조치
 
@@ -548,14 +558,14 @@ equality delete 파일(content=2) 수가 data 파일 수에 가깝거나 더 많
 
 </div>
 
-1~2단계만으로도 체감이 크게 달라질 것입니다. 3~4단계는 테이블 규모와 업데이트 비율을 측정한 뒤 결정합니다.
+커넥터를 유지했다면 1~2단계부터 하고, 3~4단계는 테이블 규모와 업데이트 비율을 측정한 뒤 정하는 것이 맞다고 판단했습니다. 실제로는 4단계에 해당하는 구조 전환(log append + mirror `MERGE`)으로 바로 갔고, mirror는 copy-on-write `MERGE`로 적재해 equality delete를 없앴습니다. 1~3단계와 v3 적용은 하지 않았습니다(9장).
 
 ## 8. 공식 커넥터와의 차이 {#official}
 
-**질문** Databricks(Tabular)와 Apache의 공식 Kafka Connect Sink가 있는데, 왜 직접 구현했나? 둘은 무엇이 다른가?
+**당시 가정** 2023년 8월 기준으로 MongoDB 이벤트와 사내 이벤트 모델을 받아 주는 공식 커넥터가 없다고 판단해, 직접 구현하기로 했습니다. 출발점으로는 getindata 커넥터를 골랐습니다.
 {: .q}
 
-자체 커넥터는 [getindata/kafka-connect-iceberg-sink](https://github.com/getindata/kafka-connect-iceberg-sink)를 참고해 만들었습니다. 설정 키(`upsert`, `upsert.keep-deletes`, `upsert.op-column`, `allow-field-addition`, `table.*`, `iceberg.partition.*`)와 "`put()`마다 테이블별로 커밋하는 구조"가 여기서 왔습니다. 공식 커넥터는 이와 다른 계보로, Tabular가 만든 커넥터가 Databricks 저장소를 거쳐 Apache Iceberg에 기증된 것입니다.
+**확인한 사실** 당시 판단은 맞았지만, 출발점의 커밋 모델까지 함께 가져온 것이 이후 커밋 경합의 원인이 되었습니다. 저는 [getindata/kafka-connect-iceberg-sink](https://github.com/getindata/kafka-connect-iceberg-sink)를 참고해 커넥터를 만들었습니다. 설정 키(`upsert`, `upsert.keep-deletes`, `upsert.op-column`, `allow-field-addition`, `table.*`, `iceberg.partition.*`)와 "`put()`마다 테이블별로 커밋하는 구조"가 여기서 왔습니다. 공식 커넥터는 이와 다른 계보로, Tabular가 만든 커넥터가 Databricks 저장소를 거쳐 Apache Iceberg에 기증된 것입니다.
 
 ### 구현 당시의 선택지
 
@@ -601,9 +611,9 @@ equality delete 파일(content=2) 수가 data 파일 수에 가깝거나 더 많
 ### 직접 구현한 이유
 
 1. **MongoDB 이벤트를 받아 주는 공식 커넥터가 없었습니다.** 원본 이벤트의 `after`는 BSON 문자열이고, Kafka 키인 `_id`도 JSON 문자열입니다. getindata와 Tabular 모두 Debezium의 관계형 DB 이벤트 형식을 기준으로 만들어져, 이 형식을 해석하지 못했습니다. Tabular에 Mongo용 SMT가 생긴 것은 자체 커넥터를 운영하던 2024-04입니다.
-2. **변환 규칙이 사내 데이터 모델에 맞춰져 있습니다.** REPLACE 구분, 자체 이벤트 모델의 작업 코드, `__updated_fields`/`__removed_fields`, soft delete, snake_case 변환이 그렇습니다. 지금 공식 SMT로도 대부분 만들 수 없습니다. 실제로 이벤트 변환기가 전체 코드의 약 4분의 1로 가장 큽니다.
+2. **변환 규칙을 사내 데이터 모델에 맞췄습니다.** REPLACE 구분, 자체 이벤트 모델의 작업 코드, `__updated_fields`/`__removed_fields`, soft delete, snake_case 변환이 그렇습니다. 지금 공식 SMT로도 대부분 만들 수 없습니다. 실제로 이벤트 변환기가 전체 코드의 약 4분의 1로 가장 큽니다.
 3. **upsert가 필요했는데, 공식 계열은 아직 초기였습니다.** 당시 Tabular 커넥터는 0.x였습니다. Apache 버전은 지금도 upsert를 지원하지 않습니다.
-4. **참고한 구현이 getindata였습니다.** 그래서 coordinator 없이 `put()`마다 커밋하는 구조도 함께 물려받았습니다. 이 문서에서 다룬 커밋 경합은 공식 커넥터를 쓰지 않아서 생긴 것이라기보다, **출발점이 된 코드의 커밋 모델**에서 생긴 것입니다.
+4. **참고한 구현이 getindata였습니다.** 그래서 coordinator 없이 `put()`마다 커밋하는 구조도 함께 가져왔습니다. 이 문서에서 다룬 커밋 경합은 공식 커넥터를 쓰지 않아서 생긴 것이라기보다, 제가 **출발점으로 삼은 코드의 커밋 모델**을 그대로 둔 데서 생겼습니다.
 
 ### 운영 중 바꾼 것
 
@@ -617,7 +627,7 @@ delta writer
 {: .where}
 
 - **배경**: 처음에는 create 이벤트면 기존 데이터가 없다고 보고 delete 없이 write만 했습니다. 그런데 Kafka offset을 되돌려 이벤트를 다시 처리하면, 이미 적재한 create 이벤트가 다시 들어옵니다. 그래서 upsert가 필요한 경우 create에도 같은 키로 delete를 먼저 하도록 바꿨습니다.
-- **평가**: at-least-once 구조에서 재처리 결과를 같게 만드는 올바른 판단이었습니다. 다만 그 대가로 모든 신규 행에 equality delete가 하나씩 붙게 되었고, 6장에서 지적한 log 테이블의 불필요한 비용이 여기서 생깁니다.
+- **돌아보면**: at-least-once 구조에서 재처리 결과를 같게 만들려는 판단은 맞았습니다. 다만 그 대가로 모든 신규 행에 equality delete가 하나씩 붙게 되었고, 6장에서 다룬 log 테이블의 불필요한 비용이 여기서 생겼습니다.
 - **공식 커넥터라면**: exactly-once라 재처리 중복이 생기지 않으므로 append 테이블에는 이 delete가 필요 없습니다. at-least-once를 유지한다면 log 테이블은 `upsert=false`로 두고 조회나 MERGE 단계에서 `(_oid, __source_ts_ms_ord)`로 중복을 제거하는 편이 저렴합니다.
 
 </div>
@@ -630,7 +640,7 @@ sink task · 테이블별 write worker (원복으로 삭제됨)
 {: .where}
 
 - **배경**: 한 배치에 여러 테이블의 이벤트가 오면 테이블을 하나씩 차례로 처리했습니다. 처리 시간을 줄이려고 테이블마다 스레드로 병렬 처리하는 로직을 넣었지만, 병렬 처리로 인한 에러가 더 많아 원래대로 되돌렸습니다.
-- **평가**: 테이블이 다르면 커밋이 완전히 병렬이므로(2장), 방향 자체는 맞았습니다. 하지만 느렸던 핵심 원인은 **같은 테이블**에 여러 task와 커넥터가 몇 초마다 커밋을 다투는 것이었습니다. 한 task 안에서 테이블을 나눠 병렬로 처리해도 이 경합은 줄어들지 않습니다.
+- **돌아보면**: 테이블이 다르면 커밋이 완전히 병렬이므로(2장), 방향 자체는 맞았습니다. 하지만 느렸던 핵심 원인은 **같은 테이블**에 여러 task와 커넥터가 몇 초마다 커밋을 다투는 것이었습니다. 한 task 안에서 테이블을 나눠 병렬로 처리해도 이 경합은 줄어들지 않았습니다.
 - **공식 커넥터라면**: 같은 생각을 coordinator 한 곳에서 합니다. 테이블당 커밋은 coordinator 하나만 하고, 여러 테이블의 커밋을 `iceberg.control.commit.threads`(기본 코어 수 × 2)로 병렬 처리합니다. 테이블 간 병렬은 살리고 테이블 내 경합은 없애는 구조입니다.
 
 </div>
@@ -650,10 +660,14 @@ sink task · 테이블별 write worker (원복으로 삭제됨)
 
 > **정리**
 >
-> 직접 구현한 것은 공식 커넥터를 두고 고르지 않은 것이 아니라, 2023년 8월에 MongoDB와 사내 이벤트 모델을 받아 주는 공식 커넥터가 없었기 때문입니다. 대신 getindata의 커밋 모델을 함께 가져오면서, 공식 커넥터의 핵심인 **테이블당 단일 committer**가 빠졌습니다. 지금 옮긴다면 변환 로직은 SMT로 살리고 커밋은 공식 커넥터에 맡기는 방식이 됩니다.
+> 제가 직접 구현하기로 한 것은 공식 커넥터를 두고 고르지 않은 것이 아니라, 2023년 8월에 MongoDB와 사내 이벤트 모델을 받아 주는 공식 커넥터가 없었기 때문입니다. 대신 getindata의 커밋 모델을 함께 가져오면서, 공식 커넥터의 핵심인 **테이블당 단일 committer**가 빠졌습니다. 지금 옮긴다면 변환 로직은 SMT로 살리고 커밋은 공식 커넥터에 맡기는 방식이 됩니다.
+>
+> 실제로는 공식 커넥터로 옮기지 않았습니다. 테이블당 단일 committer라는 핵심만 가져와, buffer sink 커넥터 + Spark 배치 구조(배치 job 1개가 테이블당 커밋)로 전환했습니다(9장).
 {: .callout .info}
 
 ## 9. 이 프로젝트 적용안 {#plan}
+
+아래 다섯 단계는 커넥터를 유지한다는 전제에서 정리한 적용안입니다. 실제로는 커넥터를 단계별로 고치는 대신 중장기안인 적재 구조 전환을 먼저 택해, buffer sink 커넥터 + Spark 배치 구조로 옮겼습니다. 전환한 구조와 그 검토는 [Buffer Writer 배치 적재 리뷰](/2026/10/15/buffer-writer-batch-review.html)에 있습니다. 각 단계 끝에 실제 상태를 적었습니다.
 
 <div class="steps" markdown="1">
 
@@ -663,7 +677,9 @@ sink task · 테이블별 write worker (원복으로 삭제됨)
 
 ### 커밋 묶기
 
-`put()`은 쓰기만 하고 `preCommit()`에서 1~5분 또는 N건마다 테이블당 1회 커밋합니다. 테이블 캐시와 `refresh()`를 쓰고 스키마 비교는 배치 단위로 합니다.
+`put()`은 쓰기만 하고 `preCommit()`에서 1~5분 또는 N건마다 테이블당 1회 커밋하는 안이었습니다. 테이블 캐시와 `refresh()`를 쓰고 스키마 비교는 배치 단위로 합니다.
+
+상태: 구조 전환으로 대체했습니다. 커넥터는 S3 버퍼 파일만 쓰고, Iceberg 커밋은 배치 job이 10분에 테이블당 2~3회 합니다.
 
 </div>
 
@@ -673,7 +689,9 @@ sink task · 테이블별 write worker (원복으로 삭제됨)
 
 ### writer 분리
 
-major mirror 테이블에 같이 쓰는 snapshot 커넥터와 upsert-major 커넥터를 시간 또는 대상 테이블로 분리합니다.
+major mirror 테이블에 같이 쓰는 snapshot 커넥터와 upsert-major 커넥터를 시간 또는 대상 테이블로 분리하는 안이었습니다.
+
+상태: 구조 전환으로 해소했습니다. 테이블당 커밋 주체가 최대 8개 task에서 배치 job 1개(CronJob `Forbid`)가 되었습니다.
 
 </div>
 
@@ -683,7 +701,9 @@ major mirror 테이블에 같이 쓰는 snapshot 커넥터와 upsert-major 커�
 
 ### 증분 유지보수
 
-`partial-progress`를 켠 증분 컴팩션을 1~2시간마다, 스냅샷 만료를 하루 1회 실행합니다. 7장 참고.
+`partial-progress`를 켠 증분 컴팩션을 1~2시간마다, 스냅샷 만료를 하루 1회 실행하는 안이었습니다. 7장 참고.
+
+상태: 적용하지 않았습니다. 전환으로 equality delete가 없어져 7장에서 다룬 컴팩션 부담의 주원인은 사라졌습니다. 다만 파티션 없는 copy-on-write mirror와 10분 단위 log 파티션은 Buffer Writer 리뷰에서 새 개선 항목으로 정리했고, 아직 적용 전입니다.
 
 </div>
 
@@ -693,7 +713,9 @@ major mirror 테이블에 같이 쓰는 snapshot 커넥터와 upsert-major 커�
 
 ### 적재 구조 전환
 
-log 테이블은 공식 Iceberg Kafka Connect Sink 또는 Flink로 append합니다. mirror 테이블은 log 테이블에서 주기적으로 `MERGE`하는 단일 job으로 바꾸고 v3를 적용합니다.
+log 테이블은 공식 Iceberg Kafka Connect Sink 또는 Flink로 append합니다. mirror 테이블은 log 테이블에서 주기적으로 `MERGE`하는 단일 job으로 바꾸고 v3를 적용하는 안이었습니다.
+
+상태: 방향은 실현했고, 구현은 다르게 갔습니다. log는 append, mirror는 log에서 `MERGE`하는 단일 배치 job이라는 구조는 그대로입니다. 다만 공식 Sink나 Flink 대신 직접 만든 buffer sink 커넥터와 Spark 배치를 썼고, mirror는 deletion vector 대신 copy-on-write `MERGE`로 적재합니다.
 
 </div>
 
@@ -703,13 +725,15 @@ log 테이블은 공식 Iceberg Kafka Connect Sink 또는 Flink로 append합니�
 
 ### bucket 파티션
 
-커넥터 upsert를 유지하는 동안에는 mirror 테이블에 `bucket(_oid)` 파티션을 추가해 equality delete 범위를 줄입니다.
+커넥터 upsert를 유지하는 동안에는 mirror 테이블에 `bucket(_oid)` 파티션을 추가해 equality delete 범위를 줄이는 안이었습니다.
+
+상태: 적용하지 않았습니다. 커넥터 upsert를 유지하지 않게 되어 전제가 사라졌고, mirror 테이블은 지금도 파티션이 없습니다.
 
 </div>
 
 </div>
 
-먼저 하위 소비자에게 분 단위 최신성이면 충분한지 확인해야 합니다. 그 답에 따라 Iceberg 단독으로 갈지, 실시간 계층을 함께 둘지가 정해집니다.
+전환의 대가로 최신성은 수 초에서 15~25분(윈도우 10분 + 대기 5분 + 실행 시간)으로 늘었습니다. 하위 소비자에게 이보다 짧은 최신성이 필요해지면, Iceberg 단독으로 갈지 5장의 실시간 계층을 함께 둘지를 다시 정해야 합니다.
 
 ## 10. 성과와 기대 효과 {#outcome}
 
@@ -719,7 +743,7 @@ log 테이블은 공식 Iceberg Kafka Connect Sink 또는 Flink로 append합니�
 
 | 구분 | 성과 |
 | --- | --- |
-| 파이프라인 구축 | MongoDB CDC 이벤트를 Kafka에서 Iceberg(Glue Catalog)로 적재하는 Kafka Connect sink를 직접 개발해 운영. 커넥터 4종으로 컬렉션별 mirror 테이블과 log 테이블을 함께 유지 |
+| 파이프라인 구축 | MongoDB CDC 이벤트를 Kafka에서 Iceberg(Glue Catalog)로 적재하는 Kafka Connect sink를 직접 설계·개발해 운영. 커넥터 4종으로 컬렉션별 mirror 테이블과 log 테이블을 함께 유지 |
 | 테이블 설계 | 최신 상태(`cdc_mirror_*`)와 변경 이력(`cdc_log_*`)을 나눔. log 테이블 키에 `__source_ts_ms_ord`를 넣어, 커밋 주기와 상관없이 변경 하나하나를 행으로 보존하는 구조 |
 | 최신성 | 경합이 없을 때 수 초 단위로 데이터 레이크에 반영 |
 | 정합성 | 같은 배치 안의 중복 키를 position delete로 정확히 처리. 실패 시 offset 커밋을 막아 at-least-once를 보장하고, upsert라 재처리해도 결과가 같음 |
@@ -727,34 +751,51 @@ log 테이블은 공식 Iceberg Kafka Connect Sink 또는 Flink로 append합니�
 
 </div>
 
-### 개선을 적용하면 얻는 것
+### 구조 전환으로 실현한 것
 
-아래 수치는 운영 설정과 코드에서 계산한 예상치입니다. 적용 후 실제 측정값으로 바꿉니다.
+커넥터를 고치는 대신 buffer sink 커넥터 + Spark 배치 구조로 전환한 결과입니다. 값은 [Buffer Writer 배치 적재 리뷰](/2026/10/15/buffer-writer-batch-review.html) 2장과 8장에 있습니다.
 
 <div class="table-wrap" markdown="1">
 
-| 개선 작업 | 무엇이 바뀌나 | 지금 | 적용 후 (예상) | 근거 |
-| --- | --- | --- | --- | --- |
-| **커밋을 1~5분 단위로 묶고, 테이블당 한 곳에서만 커밋** | major mirror 테이블당 커밋 | 몇 초마다, writer 최대 8개가 경쟁 | 1~5분에 1회, 1곳 | 5장 |
-| | 커밋 재시도와 backoff | 상시 발생 | 거의 없음 (경쟁 주체가 하나) | 2장 |
-| | 처리량 | 커밋 경쟁에 묶임 | writer 수에 비례해 늘어남 | 5장 |
-| | data·delete·manifest·metadata 파일 수 | 커밋마다 생성 | 수십~수백 분의 1 | 7장 |
-| **테이블을 캐시하고 커밋할 때만 `refresh()`** | Glue GetTable과 metadata.json 읽기 | `put()`마다 | 커밋 주기마다 | 1장 |
-| **log 테이블을 upsert에서 append로 전환** | log 테이블 equality delete | 레코드마다 1행 | 0 | 6장 |
-| **mirror 테이블에 `bucket(16, _oid)` 파티션 추가** | equality delete와 컴팩션 범위 | 테이블 전체 | 1/16 | 7장 |
-| **컴팩션을 증분으로 나눠 자주 실행** (`partial-progress`) | 최적화 작업 | 테이블 전체를 한 번에 다시 쓰다 커밋 직전에 실패 | 작은 커밋 여러 번. 실패해도 끝난 그룹은 유지 | 7장 |
-| **mirror를 log 기반 `MERGE`로 바꾸고 v3 적용** | mirror delete 파일 | 계속 누적 | data 파일당 deletion vector 1개 | 7장 |
+| 무엇이 바뀌었나 | 이전 (제가 만든 upsert 커넥터) | 전환 후 (buffer + Spark 배치) |
+| --- | --- | --- |
+| 테이블당 커밋 주체 | 최대 8개 task | 배치 job 1개 |
+| 커밋 빈도 | 몇 초마다 | 10분에 테이블당 2~3회 |
+| equality delete | 레코드마다 | 0 (log는 append, mirror는 copy-on-write `MERGE`) |
+| 재처리 | upsert 멱등성에 의존 | 결정적 파일명 + 파티션 덮어쓰기로 멱등 |
+| 원본 보존 | 없음 | S3 버퍼에 원본 이벤트를 Parquet로 보관 |
+| 최신성 | 수 초 (경합이 없을 때) | 15~25분 |
 
 </div>
 
-> **대가로 내주는 것**
+### 개선안별 상태
+
+'적용 후 (예상)'은 커넥터를 유지한다는 전제에서 운영 설정과 코드로 계산한 예상치이고, '상태'는 실제로 일어난 일입니다.
+
+<div class="table-wrap" markdown="1">
+
+| 개선 작업 | 무엇이 바뀌나 | 이전 | 적용 후 (예상) | 상태 | 근거 |
+| --- | --- | --- | --- | --- | --- |
+| **커밋을 1~5분 단위로 묶고, 테이블당 한 곳에서만 커밋** | major mirror 테이블당 커밋 | 몇 초마다, writer 최대 8개가 경쟁 | 1~5분에 1회, 1곳 | <span class="pill ok">전환으로 실현</span> 10분에 2~3회, 배치 job 1개 | 5장 |
+| | 커밋 재시도와 backoff | 상시 발생 | 거의 없음 (경쟁 주체가 하나) | <span class="pill ok">전환으로 실현</span> 커밋 주체가 하나가 됨 | 2장 |
+| | 처리량 | 커밋 경쟁에 묶임 | writer 수에 비례해 늘어남 | 실측값 없음 | 5장 |
+| | data·delete·manifest·metadata 파일 수 | 커밋마다 생성 | 수십~수백 분의 1 | 커밋 횟수는 줄었고, 파일 수 실측값은 없음 | 7장 |
+| **테이블을 캐시하고 커밋할 때만 `refresh()`** | Glue GetTable과 metadata.json 읽기 | `put()`마다 | 커밋 주기마다 | 해당 없음. 커넥터가 Iceberg에 직접 쓰지 않게 됨 | 1장 |
+| **log 테이블을 upsert에서 append로 전환** | log 테이블 equality delete | 레코드마다 1행 | 0 | <span class="pill ok">전환으로 실현</span> 0 | 6장 |
+| **mirror 테이블에 `bucket(16, _oid)` 파티션 추가** | equality delete와 컴팩션 범위 | 테이블 전체 | 1/16 | <span class="pill warn">미적용</span> mirror는 파티션 없음 | 7장 |
+| **컴팩션을 증분으로 나눠 자주 실행** (`partial-progress`) | 최적화 작업 | 테이블 전체를 한 번에 다시 쓰다 커밋 직전에 실패 | 작은 커밋 여러 번. 실패해도 끝난 그룹은 유지 | <span class="pill warn">미적용</span> | 7장 |
+| **mirror를 log 기반 `MERGE`로 바꾸고 v3 적용** | mirror delete 파일 | 계속 누적 | data 파일당 deletion vector 1개 | <span class="pill warn">부분 실현</span> `MERGE` 전환은 했고, deletion vector 대신 copy-on-write라 delete 파일이 생기지 않음 | 7장 |
+
+</div>
+
+> **대가로 내준 것**
 >
-> 최신성: 수 초(경합이 없을 때) → **1~5분**. 커밋을 묶은 만큼 쿼리에 늦게 보입니다. (5장)
+> 최신성: 커넥터를 유지하며 커밋을 묶는 안에서는 수 초 → 1~5분으로 예상했습니다. 실제 전환 후에는 **15~25분**(윈도우 10분 + 대기 5분 + 실행 시간)입니다. (5장, Buffer Writer 리뷰 2장)
 {: .callout .warn}
 
 > **측정 방법**
 >
-> 7장의 `files`, `snapshots` 메타데이터 쿼리로 delete 파일 비율, 평균 파일 크기, 시간당 커밋 수를 적용 전후로 비교합니다. 커넥터의 consumer lag과 커밋 1회 소요 시간도 함께 기록하면, 처리량이 커밋 경합에서 풀려났는지 확인할 수 있습니다.
+> 7장의 `files`, `snapshots` 메타데이터 쿼리로 delete 파일 비율, 평균 파일 크기, 시간당 커밋 수를 비교할 수 있습니다. 이 문서에는 전환 전후 실측값을 아직 넣지 않았고, 위 표에서 "실측값 없음"인 칸이 이 쿼리로 채울 항목입니다.
 {: .callout .info}
 
 * * *
