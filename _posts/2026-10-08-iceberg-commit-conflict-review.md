@@ -7,7 +7,7 @@ author: caimask
 
 MongoDB CDC 이벤트를 Kafka에서 Iceberg로 적재하던 자체 개발 Sink Connector가 느렸던 원인을 짚고, "Iceberg도 이제 row lock으로 처리된다"는 정보가 맞는지, 그리고 대용량 데이터를 빠르게 적재하려면 어떤 방식을 써야 하는지 정리한 문서입니다.
 
-작성 2026-10-08 · 보강 2026-10-22 · 대상 커넥터 v1.3.1 · Iceberg 1.4.3 · Glue Catalog
+작성 2026-10-08 · 보강 2026-10-22 · Iceberg 1.4.3 · Glue Catalog
 {: .meta}
 
 <div class="summary" markdown="1">
@@ -52,16 +52,16 @@ MongoDB CDC 이벤트를 Kafka에서 Iceberg로 적재하던 자체 개발 Sink 
 
 | 커넥터 | tasks | 대상 테이블 | 모드 |
 | --- | --- | --- | --- |
-| `log-datalake-sync-upsert` | 3 | `repo_cdc_mirror_*` (major 4종 제외) | upsert, 키 `_oid` |
-| `log-datalake-sync-upsert-major` | 3 | `repo_cdc_mirror_{product,property,room_type,rate_plan}` | upsert, 키 `_oid` |
-| `snapshot-datalake-sync-upsert` | 5 | `repo_cdc_mirror_{product,property,room_type,rate_plan}` | upsert, 키 `_oid` |
-| `log-datalake-sync-append-major` | 3 | `repo_cdc_log_*` (major 4종) | 키 `_oid, __source_ts_ms_ord`, 일 파티션 |
+| `cdc-upsert` | 3 | `cdc_mirror_*` (major 4종 제외) | upsert, 키 `_oid` |
+| `cdc-upsert-major` | 3 | `cdc_mirror_major_*` | upsert, 키 `_oid` |
+| `snapshot-upsert` | 5 | `cdc_mirror_major_*` | upsert, 키 `_oid` |
+| `cdc-append-major` | 3 | `cdc_log_*` (major 4종) | 키 `_oid, __source_ts_ms_ord`, 일 파티션 |
 
 </div>
 
 > **major mirror 테이블 4종은 writer가 최대 8개**
 >
-> upsert-major(3)와 snapshot(5) 커넥터가 같은 `repo_cdc_mirror_*` 테이블에 각자 몇 초 간격으로 커밋합니다. 커밋 경합이 가장 심했던 지점입니다.
+> upsert-major(3)와 snapshot(5) 커넥터가 같은 `cdc_mirror_major_*` 테이블에 각자 몇 초 간격으로 커밋합니다. 커밋 경합이 가장 심했던 지점입니다.
 {: .callout .warn}
 
 ### 성능 문제
@@ -70,10 +70,10 @@ MongoDB CDC 이벤트를 Kafka에서 Iceberg로 적재하던 자체 개발 Sink 
 
 | 위치 | 내용 |
 | --- | --- |
-| `IcebergUtil.java:106-109` | `put()`마다 테이블별로 즉시 커밋합니다. 커밋이 몇 초 간격으로 일어납니다. |
+| 적재 유틸의 커밋 호출 | `put()`마다 테이블별로 즉시 커밋합니다. 커밋이 몇 초 간격으로 일어납니다. |
 | `tasks.max=3` + `topics.regex` | 한 토픽의 파티션이 여러 task에 나뉘어, 같은 테이블에 task 3개가 동시에 커밋합니다. |
-| `IcebergUtil.java:55-60` | 스키마 비교를 레코드마다 하고, 스키마 확장도 별도 커밋이라 경합을 키웁니다. |
-| `IcebergSinkTask.java:96` | 매 `put()`마다 `loadTable`을 호출해 Glue GetTable과 metadata.json 읽기를 반복합니다. |
+| 적재 유틸의 스키마 처리 | 스키마 비교를 레코드마다 하고, 스키마 확장도 별도 커밋이라 경합을 키웁니다. |
+| sink task의 `put()` | 매 `put()`마다 `loadTable`을 호출해 Glue GetTable과 metadata.json 읽기를 반복합니다. |
 | MOR + equality delete | 커밋마다 작은 data/delete/manifest 파일이 생깁니다. 컴팩션이 없으면 커밋과 읽기가 함께 느려집니다. |
 
 </div>
@@ -86,7 +86,6 @@ MongoDB CDC 이벤트를 Kafka에서 Iceberg로 적재하던 자체 개발 Sink 
 - <span class="pill warn">개선</span> 한 `put()`에서 여러 테이블 커밋이 원자적이지 않습니다. upsert 테이블은 괜찮지만 append 계열은 확인이 필요합니다.
 - <span class="pill warn">개선</span> `RuntimeException`을 던지면 task가 FAILED로 멈춥니다. `errors.retry.timeout`은 converter와 SMT에만 적용되고 `put()`에는 적용되지 않습니다.
 - <span class="pill warn">개선</span> `iceberg-spark-runtime`을 통째로 포함해 jar가 무겁습니다. Iceberg 1.4.3도 오래된 버전입니다.
-- <span class="pill warn">확인</span> snapshot 커넥터 prod 설정의 warehouse 경로가 `.../pros/data/iceberg`로 오타로 보입니다.
 
 ## 2. table lock과 row lock의 실체 {#lock}
 
@@ -187,7 +186,7 @@ Iceberg 스냅샷 이력이 커밋 단위로만 남는 것은 맞습니다. 하�
 
 ### 지금도 배치 안의 중간 변경은 사라집니다
 
-`DeltaTaskWriter`는 upsert일 때 `delete(record)` 후 `write(record)`를 호출합니다. `BaseEqualityDeltaWriter`는 같은 writer 안에서 이미 insert한 키가 다시 오면 이전 행을 position delete로 지웁니다.
+delta writer는 upsert일 때 `delete(record)` 후 `write(record)`를 호출합니다. `BaseEqualityDeltaWriter`는 같은 writer 안에서 이미 insert한 키가 다시 오면 이전 행을 position delete로 지웁니다.
 
 ```
 같은 put() 안: _oid=A  v1 → v2 → v3
@@ -200,14 +199,14 @@ mirror 테이블:  v3만 남음 (v1, v2는 같은 커밋 안에서 삭제)
 
 ### 변경 이력은 log 테이블이 행으로 보존합니다
 
-`repo_cdc_log_*`는 키에 `__source_ts_ms_ord`가 들어 있어 변경 하나하나가 서로 다른 행이 됩니다. 커밋을 1분이든 10분이든으로 묶어도 사라지는 변경이 없고, 스냅샷 만료나 컴팩션과도 무관합니다.
+`cdc_log_*`는 키에 `__source_ts_ms_ord`가 들어 있어 변경 하나하나가 서로 다른 행이 됩니다. 커밋을 1분이든 10분이든으로 묶어도 사라지는 변경이 없고, 스냅샷 만료나 컴팩션과도 무관합니다.
 
 <div class="table-wrap" markdown="1">
 
 | 테이블 | 목적 | 커밋을 묶으면 |
 | --- | --- | --- |
-| `repo_cdc_mirror_*` | 최신 상태 | 잃는 것은 스냅샷이 찍히는 간격뿐 |
-| `repo_cdc_log_*` | 변경 이력 | <span class="pill ok">손실 없음</span> |
+| `cdc_mirror_*` | 최신 상태 | 잃는 것은 스냅샷이 찍히는 간격뿐 |
+| `cdc_log_*` | 변경 이력 | <span class="pill ok">손실 없음</span> |
 
 </div>
 
@@ -263,7 +262,7 @@ Databricks의 row-level concurrency는 **Delta Lake 테이블 기능**입니다(
 
 | 도구 | writer | committer | 커밋 주기 |
 | --- | --- | --- | --- |
-| Flink Iceberg Sink | 병렬 task | `IcebergFilesCommitter` (parallelism 1) | checkpoint마다 |
+| Flink Iceberg Sink | 병렬 task | `IcebergFilesCommitter` (parallelism 1) | 체크포인트마다 |
 | Iceberg Kafka Connect Sink (공식, 1.7+) | 각 task | coordinator 1개 (control topic) | `iceberg.control.commit.interval-ms`, 기본 5분 |
 | Spark Structured Streaming | executor | driver | micro-batch마다 |
 
@@ -364,14 +363,14 @@ Iceberg 행 단위 삭제
 
 ### 이 커넥터에 대입하면
 
-`DeltaTaskWriter.write()`는 upsert 모드에서 operation 종류와 상관없이 항상 `delete(record)`를 먼저 호출합니다. 신규 insert에도 equality delete 행이 하나씩 생깁니다.
+delta writer의 `write()`는 upsert 모드에서 operation 종류와 상관없이 항상 `delete(record)`를 먼저 호출합니다. 신규 insert에도 equality delete 행이 하나씩 생깁니다.
 
 <div class="table-wrap" markdown="1">
 
 | 테이블 | 현재 삭제 방식 | 평가 |
 | --- | --- | --- |
-| `repo_cdc_mirror_*` | equality delete + 배치 내 중복은 position delete | 최신 상태 유지에 필요하지만, 파티션이 없어 영향 범위가 테이블 전체 |
-| `repo_cdc_log_*` | equality delete (키에 `__source_ts_ms_ord` 포함) | 키가 매 변경마다 달라서 지울 대상이 거의 없습니다. 재처리 시 중복 방지 역할만 하는, **대부분 불필요한 비용**입니다. |
+| `cdc_mirror_*` | equality delete + 배치 내 중복은 position delete | 최신 상태 유지에 필요하지만, 파티션이 없어 영향 범위가 테이블 전체 |
+| `cdc_log_*` | equality delete (키에 `__source_ts_ms_ord` 포함) | 키가 매 변경마다 달라서 지울 대상이 거의 없습니다. 재처리 시 중복 방지 역할만 하는, **대부분 불필요한 비용**입니다. |
 
 </div>
 
@@ -431,7 +430,7 @@ Iceberg 행 단위 삭제
 **A. mirror 테이블에 bucket 파티션 추가** (커넥터를 유지하는 경우)
 
 ```sql
-ALTER TABLE glue.yanolja_mdp_prod.repo_cdc_mirror_xxx
+ALTER TABLE glue.lake_db.cdc_mirror_xxx
 ADD PARTITION FIELD bucket(16, _oid);
 ```
 
@@ -480,7 +479,7 @@ write.target-file-size-bytes               = 268435456   # 256MB 전후
 ```sql
 -- 1) 바뀐 범위만, delete가 붙은 파일 위주로, 부분 커밋하면서
 CALL glue.system.rewrite_data_files(
-  table    => 'yanolja_mdp_prod.repo_cdc_mirror_xxx',
+  table    => 'lake_db.cdc_mirror_xxx',
   strategy => 'binpack',
   -- where => '...',   -- bucket/일 파티션이 있으면 최근 변경 범위만 지정
   options  => map(
@@ -494,21 +493,21 @@ CALL glue.system.rewrite_data_files(
 );
 
 CALL glue.system.rewrite_position_delete_files(
-  table   => 'yanolja_mdp_prod.repo_cdc_mirror_xxx',
+  table   => 'lake_db.cdc_mirror_xxx',
   options => map('partial-progress.enabled', 'true')
 );
 
-CALL glue.system.rewrite_manifests('yanolja_mdp_prod.repo_cdc_mirror_xxx');
+CALL glue.system.rewrite_manifests('lake_db.cdc_mirror_xxx');
 
 CALL glue.system.expire_snapshots(
-  table       => 'yanolja_mdp_prod.repo_cdc_mirror_xxx',
+  table       => 'lake_db.cdc_mirror_xxx',
   older_than  => current_timestamp() - INTERVAL 1 DAY,
   retain_last => 20
 );
 
 -- 주 1회 정도, 진행 중인 쓰기 보호를 위해 3일 이상 여유
 CALL glue.system.remove_orphan_files(
-  table      => 'yanolja_mdp_prod.repo_cdc_mirror_xxx',
+  table      => 'lake_db.cdc_mirror_xxx',
   older_than => current_timestamp() - INTERVAL 3 DAYS
 );
 ```
@@ -525,12 +524,12 @@ CALL glue.system.remove_orphan_files(
 SELECT content, count(*) AS files,
        round(sum(file_size_in_bytes)/1024/1024) AS mb,
        round(avg(file_size_in_bytes)/1024/1024, 1) AS avg_mb
-FROM glue.yanolja_mdp_prod.repo_cdc_mirror_xxx.files
+FROM glue.lake_db.cdc_mirror_xxx.files
 GROUP BY content;
 
 -- 시간대별 커밋 빈도
 SELECT date_trunc('hour', committed_at) AS h, count(*) AS commits
-FROM glue.yanolja_mdp_prod.repo_cdc_mirror_xxx.snapshots
+FROM glue.lake_db.cdc_mirror_xxx.snapshots
 GROUP BY 1 ORDER BY 1 DESC LIMIT 24;
 ```
 
@@ -566,12 +565,12 @@ equality delete 파일(content=2) 수가 data 파일 수에 가깝거나 더 많
 | --- | --- |
 | 2022-03 | getindata 커넥터 공개. Debezium 이벤트를 받아 `put()`마다 커밋하는 구조 |
 | 2023-05 | Tabular 커넥터 0.1.0 공개. upsert 모드는 처음부터 있음 |
-| **2023-08-31** | **자체 커넥터 개발 시작** (MDP-37, Iceberg 1.2.1, getindata 참고) |
+| **2023-08-31** | **자체 커넥터 개발 시작** (Iceberg 1.2.1, getindata 참고) |
 | 2023-09-19 | Tabular에 CDC/upsert용 ID 컬럼 설정 추가 (0.4.x → 0.5) |
-| 2023-11 ~ 12 | 자체 커넥터 운영 대응: MDP-274(create에도 delete 선행), MDP-318(테이블별 병렬 처리 시도 후 원복) |
+| 2023-11 ~ 12 | 자체 커넥터 운영 대응: create에도 delete 선행, 테이블별 병렬 처리 시도 후 원복 |
 | 2024-04-23 | Tabular에 MongoDB Debezium SMT가 처음 추가됨 |
 | 2024-11 | Apache Iceberg 1.7.0에 Kafka Connect Sink 포함. **upsert는 빠짐** |
-| 2024-12-26 | 자체 커넥터 archive (MDP-610) |
+| 2024-12-26 | 자체 커넥터 archive |
 | 2026-08 | Apache에 기증 전 upsert 기능을 되살리자는 이슈([#17542](https://github.com/apache/iceberg/issues/17542))가 올라옴. 이 문서를 고친 시점에 아직 열려 있음 |
 
 </div>
@@ -584,25 +583,25 @@ equality delete 파일(content=2) 수가 data 파일 수에 가깝거나 더 많
 
 | 항목 | 자체 커넥터 | Tabular (`io.tabular.*`) | Apache (`org.apache.iceberg.connect.*`) |
 | --- | --- | --- | --- |
-| 커밋 주체 | <span class="pill bad">task마다</span> `put()`마다 테이블별 `rowDelta.commit()` (`IcebergUtil.java:109`) | <span class="pill ok">테이블당 1</span> coordinator가 control topic으로 모아 커밋 | Tabular와 같음. `commit.interval-ms` 기본 5분 |
+| 커밋 주체 | <span class="pill bad">task마다</span> `put()`마다 테이블별 `rowDelta.commit()` | <span class="pill ok">테이블당 1</span> coordinator가 control topic으로 모아 커밋 | Tabular와 같음. `commit.interval-ms` 기본 5분 |
 | 전달 보장 | at-least-once. upsert라 재처리해도 결과가 같음 | exactly-once (KIP-447) | 같음 |
-| upsert | 항상 delete 후 write (`DeltaTaskWriter.java:61-80`) | `upsert-mode-enabled`, `cdc-field` | <span class="pill bad">없음</span> 설정 키가 없음 |
+| upsert | 항상 delete 후 write | `upsert-mode-enabled`, `cdc-field` | <span class="pill bad">없음</span> 설정 키가 없음 |
 | 삭제 이벤트 | `upsert.keep-deletes=true`면 행을 지우지 않고 `__op=d`로 남김 | 행을 삭제 | 해당 없음 |
 | MongoDB 이벤트 | BSON 문자열인 `after`를 직접 파싱. `updateDescription` 유무로 UPDATE와 REPLACE 구분 | 2024-04 이전에는 없음 | `MongoDebeziumTransform` (Experimental) |
 | 변경 메타데이터 | `__updated_fields`, `__removed_fields`, `__source_ts_ms_ord`, `__event_ts_ms`, `__kafka_ts_ms` | `_cdc.op`, `_cdc.ts`, `_cdc.source` 등 | 같음 |
-| 작업 코드 | 사내 protobuf `OperationType`에 맞춤 (MDP-245) | Debezium의 c/u/d | 같음 |
-| 테이블 결정 | `table.name.rule`(`{database}_{table}`), 컬렉션 include/exclude 목록 | `route-regex` 또는 `route-field` | 같음 |
+| 작업 코드 | 자체 이벤트 모델의 작업 코드에 맞춤 | Debezium의 c/u/d | 같음 |
+| 테이블 결정 | 테이블 이름 규칙 설정(`{database}_{table}`), 컬렉션 include/exclude 목록 | `route-regex` 또는 `route-field` | 같음 |
 | 필드명 | snake_case로 변환 | 원래 이름 그대로 | 같음 |
-| 스키마 진화 | 레코드마다 비교. 한 배치 안의 문서 스키마가 제각각이라 스키마별로 묶지 않음 (`IcebergUtil.java:53` 주석) | `evolve-schema-enabled` | 같음 |
-| 변환 실패 | `exception.message.skippable`로 건너뛸 수 있음 | 확인 못 함 | 확인 못 함 |
+| 스키마 진화 | 레코드마다 비교. 한 배치 안의 문서 스키마가 제각각이라 스키마별로 묶지 않음 | `evolve-schema-enabled` | 같음 |
+| 변환 실패 | 설정으로 건너뛸 수 있음 | 확인 못 함 | 확인 못 함 |
 | 운영 요소 | 커넥터만 있으면 됨 | control topic, 별도 consumer group | 같음 |
 
 </div>
 
 ### 직접 구현한 이유
 
-1. **MongoDB 이벤트를 받아 주는 공식 커넥터가 없었습니다.** MDP 이벤트의 `after`는 BSON 문자열이고, Kafka 키인 `_id`도 JSON 문자열(`unique_key_set`, `type_name`)입니다. getindata와 Tabular 모두 Debezium의 관계형 DB 이벤트 형식을 기준으로 만들어져, 이 형식을 해석하지 못했습니다. Tabular에 Mongo용 SMT가 생긴 것은 자체 커넥터를 운영하던 2024-04입니다.
-2. **변환 규칙이 사내 데이터 모델에 맞춰져 있습니다.** REPLACE 구분, protobuf 작업 코드, `__updated_fields`/`__removed_fields`, soft delete, snake_case 변환이 그렇습니다. 지금 공식 SMT로도 대부분 만들 수 없습니다. 실제로 변환기(`MongoEventToRecordConverter`)가 전체 코드 1,905줄 중 486줄로 가장 큽니다.
+1. **MongoDB 이벤트를 받아 주는 공식 커넥터가 없었습니다.** 원본 이벤트의 `after`는 BSON 문자열이고, Kafka 키인 `_id`도 JSON 문자열입니다. getindata와 Tabular 모두 Debezium의 관계형 DB 이벤트 형식을 기준으로 만들어져, 이 형식을 해석하지 못했습니다. Tabular에 Mongo용 SMT가 생긴 것은 자체 커넥터를 운영하던 2024-04입니다.
+2. **변환 규칙이 사내 데이터 모델에 맞춰져 있습니다.** REPLACE 구분, 자체 이벤트 모델의 작업 코드, `__updated_fields`/`__removed_fields`, soft delete, snake_case 변환이 그렇습니다. 지금 공식 SMT로도 대부분 만들 수 없습니다. 실제로 이벤트 변환기가 전체 코드의 약 4분의 1로 가장 큽니다.
 3. **upsert가 필요했는데, 공식 계열은 아직 초기였습니다.** 당시 Tabular 커넥터는 0.x였습니다. Apache 버전은 지금도 upsert를 지원하지 않습니다.
 4. **참고한 구현이 getindata였습니다.** 그래서 coordinator 없이 `put()`마다 커밋하는 구조도 함께 물려받았습니다. 이 문서에서 다룬 커밋 경합은 공식 커넥터를 쓰지 않아서 생긴 것이라기보다, **출발점이 된 코드의 커밋 모델**에서 생긴 것입니다.
 
@@ -612,9 +611,9 @@ equality delete 파일(content=2) 수가 data 파일 수에 가깝거나 더 많
 
 <div class="finding" markdown="1">
 
-### <span class="id">MDP-274</span> create 이벤트에도 delete 선행 (2023-11)
+### <span class="id">R1</span> create 이벤트에도 delete 선행 (2023-11)
 
-DeltaTaskWriter.java:61-80
+delta writer
 {: .where}
 
 - **배경**: 처음에는 create 이벤트면 기존 데이터가 없다고 보고 delete 없이 write만 했습니다. 그런데 Kafka offset을 되돌려 이벤트를 다시 처리하면, 이미 적재한 create 이벤트가 다시 들어옵니다. 그래서 upsert가 필요한 경우 create에도 같은 키로 delete를 먼저 하도록 바꿨습니다.
@@ -625,9 +624,9 @@ DeltaTaskWriter.java:61-80
 
 <div class="finding" markdown="1">
 
-### <span class="id">MDP-318</span> 테이블별 병렬 처리 시도 후 원복 (2023-12)
+### <span class="id">R2</span> 테이블별 병렬 처리 시도 후 원복 (2023-12)
 
-IcebergSinkTask.java · IcebergTableWriteWorker.java (원복으로 삭제됨)
+sink task · 테이블별 write worker (원복으로 삭제됨)
 {: .where}
 
 - **배경**: 한 배치에 여러 테이블의 이벤트가 오면 테이블을 하나씩 차례로 처리했습니다. 처리 시간을 줄이려고 테이블마다 스레드로 병렬 처리하는 로직을 넣었지만, 병렬 처리로 인한 에러가 더 많아 원래대로 되돌렸습니다.
@@ -644,8 +643,8 @@ IcebergSinkTask.java · IcebergTableWriteWorker.java (원복으로 삭제됨)
 
 | 테이블 | 공식 커넥터 적용 | 남는 작업 |
 | --- | --- | --- |
-| `repo_cdc_log_*` | <span class="pill ok">가능</span> Apache 버전으로 append. exactly-once라 equality delete가 필요 없음 | `MongoDebeziumTransform`은 Experimental. 사내 메타데이터 필드, REPLACE 구분, snake_case 변환은 직접 만든 SMT로 옮겨야 함 |
-| `repo_cdc_mirror_*` | <span class="pill bad">어려움</span> Apache 버전에 upsert가 없음 | log 테이블에서 주기적으로 `MERGE`하는 job으로 전환 (9장). Tabular 포크는 유지보수가 끊겼고, 같은 커밋 안 equality delete 중복 문제를 직접 막아야 함 |
+| `cdc_log_*` | <span class="pill ok">가능</span> Apache 버전으로 append. exactly-once라 equality delete가 필요 없음 | `MongoDebeziumTransform`은 Experimental. 사내 메타데이터 필드, REPLACE 구분, snake_case 변환은 직접 만든 SMT로 옮겨야 함 |
+| `cdc_mirror_*` | <span class="pill bad">어려움</span> Apache 버전에 upsert가 없음 | log 테이블에서 주기적으로 `MERGE`하는 job으로 전환 (9장). Tabular 포크는 유지보수가 끊겼고, 같은 커밋 안 equality delete 중복 문제를 직접 막아야 함 |
 
 </div>
 
@@ -721,7 +720,7 @@ log 테이블은 공식 Iceberg Kafka Connect Sink 또는 Flink로 append합니�
 | 구분 | 성과 |
 | --- | --- |
 | 파이프라인 구축 | MongoDB CDC 이벤트를 Kafka에서 Iceberg(Glue Catalog)로 적재하는 Kafka Connect sink를 직접 개발해 운영. 커넥터 4종으로 컬렉션별 mirror 테이블과 log 테이블을 함께 유지 |
-| 테이블 설계 | 최신 상태(`repo_cdc_mirror_*`)와 변경 이력(`repo_cdc_log_*`)을 나눔. log 테이블 키에 `__source_ts_ms_ord`를 넣어, 커밋 주기와 상관없이 변경 하나하나를 행으로 보존하는 구조 |
+| 테이블 설계 | 최신 상태(`cdc_mirror_*`)와 변경 이력(`cdc_log_*`)을 나눔. log 테이블 키에 `__source_ts_ms_ord`를 넣어, 커밋 주기와 상관없이 변경 하나하나를 행으로 보존하는 구조 |
 | 최신성 | 경합이 없을 때 수 초 단위로 데이터 레이크에 반영 |
 | 정합성 | 같은 배치 안의 중복 키를 position delete로 정확히 처리. 실패 시 offset 커밋을 막아 at-least-once를 보장하고, upsert라 재처리해도 결과가 같음 |
 | 운영 편의 | 새 필드가 들어오면 테이블 스키마를 자동으로 확장 |

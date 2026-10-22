@@ -90,7 +90,7 @@ Iceberg 스펙의 sequence number 규칙 때문에 생기는 제약입니다.
 | --- | --- | --- | --- |
 | 커밋 주체 | <span class="pill ok">테이블당 1</span> Coordinator | <span class="pill bad">task마다</span> 최대 8개 | <span class="pill ok">1</span> 배치 job |
 | 커밋 주기 | 설정한 간격 (분 단위, 글에 수치 없음) | <span class="pill bad">몇 초</span> `put()`마다 | 10분 |
-| writer 핵심부 | `BaseEqualityDeltaWriter` 계열 | `BaseEqualityDeltaWriter` (`DeltaTaskWriter`) | Spark `MERGE` (CoW) |
+| writer 핵심부 | `BaseEqualityDeltaWriter` 계열 | `BaseEqualityDeltaWriter` (delta writer) | Spark `MERGE` (CoW) |
 | 삭제 방식 | equality + position delete (MOR) | equality + position delete (MOR) | 파일 재작성 (CoW) |
 | 같은 커밋 내 중복 위험 | <span class="pill warn">있었음</span> 세 가지 경우, 수정 완료 | <span class="pill ok">현재 없음</span> 커밋이 `put()` 단위라 writer와 맵의 수명이 같음 | <span class="pill ok">없음</span> |
 | 커밋 경합 | <span class="pill ok">없음</span> | <span class="pill bad">심함</span> | <span class="pill ok">없음</span> (중복 실행 시 예외) |
@@ -113,7 +113,7 @@ Iceberg 스펙의 sequence number 규칙 때문에 생기는 제약입니다.
 
 ### <span class="pill ok">충족</span> <span class="id">이슈 1</span> Kafka 키 = 테이블 id
 
-connectors/mdp-repo-log-collector · MongoEventToRecordConverter.java:164-182
+CDC source 커넥터 (Debezium) · 이벤트 변환기
 {: .where}
 
 - Debezium MongoDB 커넥터는 문서의 `_id`를 Kafka 메시지 키로 씁니다. `RegexRouter`는 토픽 이름만 바꾸고 키는 그대로 둡니다. 그래서 같은 문서는 항상 같은 파티션으로 갑니다.
@@ -121,7 +121,7 @@ connectors/mdp-repo-log-collector · MongoEventToRecordConverter.java:164-182
 
 > **주의: 같은 mirror 테이블을 두 토픽에서 씀**
 >
-> `repo_cdc_mirror_{product,…}`는 cdc 토픽(upsert-major 커넥터)과 snapshot 토픽(snapshot 커넥터) 양쪽에서 씁니다. 지금은 커넥터마다 따로 커밋해서 순서 문제만 있습니다. 하지만 coordinator 방식에서 두 토픽을 한 커넥터로 합치면, 같은 id가 다른 Worker를 거쳐 같은 커밋에 들어가 **이슈 1과 똑같은 중복**이 생깁니다. 토픽이 달라도 같은 테이블에 쓰면 이슈 1에 해당합니다.
+> `cdc_mirror_major_*`는 cdc 토픽(`cdc-upsert-major` 커넥터)과 snapshot 토픽(`snapshot-upsert` 커넥터) 양쪽에서 씁니다. 지금은 커넥터마다 따로 커밋해서 순서 문제만 있습니다. 하지만 coordinator 방식에서 두 토픽을 한 커넥터로 합치면, 같은 id가 다른 Worker를 거쳐 같은 커밋에 들어가 **이슈 1과 똑같은 중복**이 생깁니다. 토픽이 달라도 같은 테이블에 쓰면 이슈 1에 해당합니다.
 {: .callout .warn}
 
 </div>
@@ -138,11 +138,11 @@ connectors/mdp-repo-log-collector · MongoEventToRecordConverter.java:164-182
 
 ### <span class="pill warn">1단계부터 해당</span> <span class="id">이슈 3</span> 스키마 변경 시 writer 교체
 
-IcebergUtil.java:52-62, 92-93 · IcebergDataWriter.java:28-95 · DeltaTaskWriter.java:83-97
+적재 유틸 · data writer · delta writer
 {: .where}
 
-- 지금은 `addRowsToTable()`이 먼저 스키마 변경을 모두 커밋한 다음, 새 writer를 하나 만들어 배치 전체를 쓰고 바로 커밋합니다. writer와 맵이 커밋과 같은 수명이라 문제가 없습니다.
-- 커밋 묶기를 적용하면 writer가 여러 `put()`에 걸쳐 살아 있게 됩니다. 그러면 중간에 새 필드가 들어올 때 writer를 바꿔야 하고, 새 `RowDataDeltaWriter`의 `insertedRowMap`은 비어 있습니다. 같은 커밋 안에서 이전 writer가 쓴 id가 다시 오면 equality delete가 되어, **토스와 똑같은 중복**이 생깁니다.
+- 지금은 적재 유틸의 테이블 적재 함수가 먼저 스키마 변경을 모두 커밋한 다음, 새 writer를 하나 만들어 배치 전체를 쓰고 바로 커밋합니다. writer와 맵이 커밋과 같은 수명이라 문제가 없습니다.
+- 커밋 묶기를 적용하면 writer가 여러 `put()`에 걸쳐 살아 있게 됩니다. 그러면 중간에 새 필드가 들어올 때 writer를 바꿔야 하고, 새 delta writer의 `insertedRowMap`은 비어 있습니다. 같은 커밋 안에서 이전 writer가 쓴 id가 다시 오면 equality delete가 되어, **토스와 똑같은 중복**이 생깁니다.
 - `insertedRowMap`은 Iceberg의 `BaseTaskWriter.BaseEqualityDeltaWriter` 안에 private으로 있습니다. 그래서 상속만으로는 밖으로 꺼낼 수 없고, 이 클래스를 우리 코드로 옮겨 와 고쳐야 합니다(5장).
 
 </div>
@@ -164,7 +164,7 @@ IcebergUtil.java:52-62, 92-93 · IcebergDataWriter.java:28-95 · DeltaTaskWriter
 
 > **권장**
 >
-> **A로 시작하세요.** 우리 구성은 모든 컬렉션이 한 토픽(`mdp.private.cdc.accommodation`)에 있고 task가 3개라, task별로 5분마다 커밋해도 테이블당 5분에 최대 3회입니다. 앞 문서에서 본 경합(몇 초마다 최대 8개)과 비교하면 사실상 사라지는 수준입니다. 테이블당 커밋을 하나로 줄이거나 exactly-once가 필요해지면 그때 B나 C로 갑니다. 또 log 테이블은 D(공식 커넥터, append)로, mirror는 Spark `MERGE`로 나누는 조합도 유효합니다(7장).
+> **A로 시작하세요.** 우리 구성은 모든 컬렉션이 한 토픽(`cdc.events`)에 있고 task가 3개라, task별로 5분마다 커밋해도 테이블당 5분에 최대 3회입니다. 앞 문서에서 본 경합(몇 초마다 최대 8개)과 비교하면 사실상 사라지는 수준입니다. 테이블당 커밋을 하나로 줄이거나 exactly-once가 필요해지면 그때 B나 C로 갑니다. 또 log 테이블은 D(공식 커넥터, append)로, mirror는 Spark `MERGE`로 나누는 조합도 유효합니다(7장).
 {: .callout .ok}
 
 ## 5. 코드 변경 사항 (1단계: 커밋 묶기 + 레지스트리) {#changes}
@@ -175,29 +175,29 @@ IcebergUtil.java:52-62, 92-93 · IcebergDataWriter.java:28-95 · DeltaTaskWriter
 
 | 파일 | 변경 내용 |
 | --- | --- |
-| `IcebergSinkTask.java` | `put()`은 쓰기만 하고, 커밋은 `preCommit()`에서 간격이나 건수 조건이 차면 수행. 커밋에 성공한 경우에만 offset 반환. `close()`/`stop()`에서 열린 writer abort |
-| `IcebergUtil.java` | `addRecord()`를 쓰기(`write`)와 커밋(`commit`)으로 분리. 스키마 비교는 배치 단위로 한 번. 스키마가 바뀌면 writer 교체(roll) |
-| **신규** `TableWriterState.java` | 테이블별 상태: 현재 writer, 교체된 writer들의 `WriteResult` 목록, 레지스트리, 파티션별 마지막 offset |
-| **신규** `InsertedRowRegistry.java` | 키 → (파일 경로, 행 위치) 맵. 테이블별로 하나, **커밋할 때만** 비움 |
-| **신규** `RegistryEqualityDeltaWriter.java` | Iceberg `BaseEqualityDeltaWriter`를 옮겨 와서 내부 맵 대신 레지스트리를 쓰도록 수정 |
-| `DeltaTaskWriter.java` | `RowDataDeltaWriter`가 새 클래스를 상속하고 생성자로 레지스트리를 받음 |
-| `IcebergDataWriter.java` | `getWriter()`가 레지스트리를 받아 delta writer에 전달 |
-| `IcebergSinkConfig*.java` | `iceberg.commit.interval-ms`(기본 300000), `iceberg.commit.max-records` 추가 |
+| sink task | `put()`은 쓰기만 하고, 커밋은 `preCommit()`에서 간격이나 건수 조건이 차면 수행. 커밋에 성공한 경우에만 offset 반환. `close()`/`stop()`에서 열린 writer abort |
+| 적재 유틸 | 레코드 적재 함수를 쓰기(`write`)와 커밋(`commit`)으로 분리. 스키마 비교는 배치 단위로 한 번. 스키마가 바뀌면 writer 교체(roll) |
+| **신규** 테이블 상태 (`TableState`) | 테이블별 상태: 현재 writer, 교체된 writer들의 `WriteResult` 목록, 레지스트리, 파티션별 마지막 offset |
+| **신규** 레지스트리 (`InsertedRowRegistry`) | 키 → (파일 경로, 행 위치) 맵. 테이블별로 하나, **커밋할 때만** 비움 |
+| **신규** 레지스트리 기반 equality delta writer (`RegistryEqualityDeltaWriter`) | Iceberg `BaseEqualityDeltaWriter`를 옮겨 와서 내부 맵 대신 레지스트리를 쓰도록 수정 |
+| delta writer | 내부 행 writer가 새 클래스를 상속하고 생성자로 레지스트리를 받음 |
+| writer 생성 팩토리 | writer 생성 함수가 레지스트리를 받아 delta writer에 전달 |
+| 커넥터 설정 클래스 | `iceberg.commit.interval-ms`(기본 300000), `iceberg.commit.max-records` 추가 |
 
 </div>
 
-### IcebergSinkTask: 쓰기와 커밋 분리
+### sink task: 쓰기와 커밋 분리
 
 ```java
-private final Map<String, TableWriterState> states = new HashMap<>();
+private final Map<String, TableState> states = new HashMap<>();
 private long lastCommitMs = System.currentTimeMillis();
 
 @Override
 public void put(Collection<SinkRecord> records) {
   // 변환과 테이블별 그룹핑은 기존과 같음
   for (var e : grouped.entrySet()) {
-    TableWriterState st = states.computeIfAbsent(e.getKey(), this::openState);
-    icebergUtil.write(st, e.getValue());        // 커밋하지 않음
+    TableState st = states.computeIfAbsent(e.getKey(), this::openState);
+    loader.write(st, e.getValue());        // 커밋하지 않음
     st.trackOffsets(e.getValue());              // TopicPartition별 최대 offset
   }
 }
@@ -206,8 +206,8 @@ public void put(Collection<SinkRecord> records) {
 public Map<TopicPartition, OffsetAndMetadata> preCommit(Map<TopicPartition, OffsetAndMetadata> current) {
   if (!commitDue()) return Map.of();            // offset 커밋 보류
   Map<TopicPartition, OffsetAndMetadata> safe = new HashMap<>();
-  for (TableWriterState st : states.values()) {
-    icebergUtil.commit(st);                     // RowDelta 1회 + registry.clear()
+  for (TableState st : states.values()) {
+    loader.commit(st);                     // RowDelta 1회 + registry.clear()
     st.offsets().forEach((tp, off) -> safe.merge(tp, new OffsetAndMetadata(off + 1),
         (a, b) -> a.offset() >= b.offset() ? a : b));
   }
@@ -222,24 +222,24 @@ public Map<TopicPartition, OffsetAndMetadata> preCommit(Map<TopicPartition, Offs
 - 파티션에 들어온 레코드가 전부 필터링되거나 변환에서 빠지면 그 파티션은 어느 테이블 상태에도 기록되지 않습니다. 이런 파티션의 offset은 Connect가 넘겨준 `current` 값으로 함께 전진시켜야 lag이 쌓이지 않습니다.
 - 건수 조건(`max-records`)을 함께 두세요. 레지스트리와 Parquet 버퍼의 메모리 사용량이 커밋 간격 동안 들어온 키 수에 비례합니다.
 
-### IcebergUtil: 스키마 변경 시 writer 교체
+### 적재 유틸: 스키마 변경 시 writer 교체
 
 ```java
-public void write(TableWriterState st, List<IcebergChangeRecord> records) {
-  if (config.isAllowFieldAddition()) {
+public void write(TableState st, List<ChangeRecord> records) {
+  if (config.allowFieldAddition()) {
     Schema union = unionSchemas(records);                // 배치에서 한 번만 계산
-    if (applyFieldAddition(st.table(), union)) {         // 스키마 커밋이 일어난 경우
+    if (addNewFields(st.table(), union)) {               // 스키마 커밋이 일어난 경우
       st.table().refresh();
-      st.rollWriter(IcebergDataWriter.getWriter(st.table(), config, st.registry()));
+      st.rollWriter(WriterFactory.create(st.table(), config, st.registry()));
       // rollWriter: 이전 writer.complete() 결과를 pending 목록에 보관하고 새 writer로 교체
     }
   }
-  for (IcebergChangeRecord r : records) {
-    st.writer().write(r.asIcebergRecord(st.table().schema(), ...), r.operationCode());
+  for (ChangeRecord r : records) {
+    st.writer().write(r.toRecord(st.table().schema(), ...), r.operationCode());
   }
 }
 
-public void commit(TableWriterState st) {
+public void commit(TableState st) {
   WriteResult last = st.closeWriter();
   RowDelta delta = st.table().newRowDelta();
   for (WriteResult r : st.allResults(last)) {            // 교체된 writer들 + 마지막 writer
@@ -285,13 +285,13 @@ private boolean internalPosDelete(StructLike key) {
 ```
 
 - **레지스트리는 테이블별로 하나**이고, 키 타입은 테이블의 identifier 필드(`deleteSchema`)로 만듭니다. 스키마가 바뀌어도 identifier 필드가 그대로면 같은 맵을 계속 쓸 수 있습니다. identifier 필드가 바뀌는 변경이면 먼저 커밋한 뒤 교체하세요.
-- **파티션 테이블**(`PartitionedDeltaWriter`)은 파티션마다 writer가 따로 있습니다. 하지만 레지스트리 키가 id라서 테이블 단위로 하나만 두면 됩니다. 같은 id가 커밋 안에서 다른 파티션으로 옮겨 가도(예: `__p_time` 변경) 이전 위치를 position delete로 지울 수 있습니다. 지금 코드는 파티션별로 맵이 따로라 이 경우를 놓치므로, 오히려 더 정확해집니다.
+- **파티션 테이블**(파티션별 delta writer)은 파티션마다 writer가 따로 있습니다. 하지만 레지스트리 키가 id라서 테이블 단위로 하나만 두면 됩니다. 같은 id가 커밋 안에서 다른 파티션으로 옮겨 가도(예: 파티션 시간 컬럼 값 변경) 이전 위치를 position delete로 지울 수 있습니다. 지금 코드는 파티션별로 맵이 따로라 이 경우를 놓치므로, 오히려 더 정확해집니다.
 - 이전 writer가 닫은 파일을 가리키는 position delete도 유효합니다. 같은 커밋에 들어가면 sequence number가 같아서 "같거나 작은" 규칙에 맞습니다.
 
 ### 함께 정리할 것
 
 - **major mirror 테이블의 이중 writer**: snapshot 커넥터와 upsert-major 커넥터를 시간으로 분리하거나, snapshot은 별도 테이블로 적재한 뒤 Spark `MERGE`로 반영합니다.
-- **`__source_ts_ms_ord` 인코딩**(Buffer Writer 리뷰 S3): 같은 계산이 이 커넥터에도 있습니다(`MongoEventToRecordConverter.java:249`).
+- **`__source_ts_ms_ord` 인코딩**(Buffer Writer 리뷰 S3): 같은 계산이 이 커넥터의 이벤트 변환기에도 있습니다.
 - **실패 시 writer abort**: 커밋 전에 예외가 나면 열린 writer와 교체된 writer의 파일을 모두 `abort()`해서 고아 파일을 남기지 않습니다.
 - **컴팩션**: 커밋을 묶어도 equality delete는 계속 생깁니다. 「커밋 경합 리뷰」 7장의 증분 컴팩션을 함께 운영해야 합니다. 토스 글 댓글에서도 컴팩션 비용이 미해결 질문으로 남아 있습니다.
 
@@ -329,7 +329,7 @@ private boolean internalPosDelete(StructLike key) {
 
 > **확인이 필요한 전제**
 >
-> source가 AWS DocumentDB(`mdp-docdb5-prod…docdb.amazonaws.com`)입니다. 토스 글과 이 문서의 분석은 Debezium MongoDB 커넥터의 키와 순서 의미를 전제로 합니다. DocumentDB change stream에서 `source.ord`와 키 형식이 MongoDB와 같은지 실제 데이터로 한 번 확인하세요.
+> source가 AWS DocumentDB입니다. 토스 글과 이 문서의 분석은 Debezium MongoDB 커넥터의 키와 순서 의미를 전제로 합니다. DocumentDB change stream에서 `source.ord`와 키 형식이 MongoDB와 같은지 실제 데이터로 한 번 확인하세요.
 {: .callout .warn}
 
 ## 8. 성과와 기대 효과 {#outcome}

@@ -62,7 +62,7 @@ input {
     use_column_value => true
     tracking_column => "id"
     schedule => "*/5 * * * * *"
-    statement => "SELECT id, json_extract(`event`, '$') as event, json_unquote(json_extract(`event`,'$.table.id')) as table_id FROM hand WHERE id > :sql_last_value limit 10000"
+    statement => "SELECT id, json_extract(`event`, '$') as event, json_unquote(json_extract(`event`,'$.table.id')) as table_id FROM event_log WHERE id > :sql_last_value limit 10000"
     last_run_metadata_path => "/etc/logstash/last_sql_index"
   }
 }

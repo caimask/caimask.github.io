@@ -41,11 +41,11 @@ MySQL에 등록된 로그 설정 한 row마다 수집(intake) DAG 하나를 만�
 
 ## 1. 기존 구성 {#setup}
 
-로그 수집 대상이 MySQL의 `log_register` 테이블에 등록되면, DAG 파일 하나가 이 테이블을 조회해 row마다 수집 DAG을 만듭니다. 수집 대상을 추가할 때 코드를 고치지 않고 row만 넣으면 된다는 장점이 있었습니다.
+로그 수집 대상이 MySQL의 `source_registry` 테이블에 등록되면, DAG 파일 하나가 이 테이블을 조회해 row마다 수집 DAG을 만듭니다. 수집 대상을 추가할 때 코드를 고치지 않고 row만 넣으면 된다는 장점이 있었습니다.
 
 ```
-MySQL log_register (row 1개 = 수집 대상 1개)
-   │  DAG 파일 최상단: load_log_config()로 전체 조회
+MySQL source_registry (row 1개 = 수집 대상 1개)
+   │  DAG 파일 최상단: load_source_config()로 전체 조회
    ▼
 for item in items:
     globals()[dag_id] = create_dag(dag_id, default_args, item)   ← row 수만큼 반복
@@ -96,15 +96,15 @@ DAG 파일은 정의 파일이 아니라 **실행되는 파이썬 코드**입니
 
 ```python
 # 모듈 최상단: 파싱마다 1회
-DE_COMMON_PWD = config.get_ssm_parameter("/<env>/application/.../app")   # AWS SSM API 호출
-items = load_log_config()                                                # MySQL 조회
+AUDIT_PASSWORD = get_secret("/<env>/audit/password")   # AWS SSM API 호출
+items = load_source_config()                           # MySQL 조회
 
-def create_dag(dag_id, default_args, db_config):
+def create_dag(dag_id, default_args, cfg):
     ...
-    pool_name = create_group_pool(group_name, GLUE_JOB_CONCURRENT_RUN_LIMIT)[0]  # 파싱마다 N회
-    dag = DAG(dag_id, schedule_interval=get_schedule_interval(), ...)          # 파싱마다 N회
+    pool = ensure_pool(cfg["group"], slots=MAX_GLUE_RUNS)       # 파싱마다 N회
+    dag = DAG(dag_id, schedule=get_schedule(), ...)             # 파싱마다 N회
     with dag:
-        t_pre = PreHookOperator(...)          # Operator 생성자도 파싱마다 N회
+        pre = TriggerAndWait(task_id="task_pre", ...)           # Operator 생성자도 파싱마다 N회
         ...
 ```
 
@@ -112,12 +112,12 @@ def create_dag(dag_id, default_args, db_config):
 
 | 위치 | 코드 | 파싱 1회당 | 심각도 |
 | --- | --- | --- | --- |
-| `create_dag` 내부 | `create_group_pool(...)` | **N회**. 메타 DB 조회나 쓰기로 추정 | <span class="pill bad">매우 높음</span> |
-| `create_dag` 내부 | `get_schedule_interval()` | **N회**. Variable 조회라면 메타 DB 접근 | <span class="pill bad">확인 필요</span> |
-| `create_dag` 내부 | `PreHookOperator`, `PostHookOperator`, `AwsGlueJobOperator` 생성자 | N회씩. 생성자에서 boto3나 DB를 부르면 치명적 | <span class="pill warn">확인 필요</span> |
-| 모듈 최상단 | `config.get_ssm_parameter(...)` | 1회. AWS SSM API 호출 | <span class="pill warn">높음</span> |
-| 모듈 최상단 | `load_log_config()` | 1회. 서브쿼리가 있는 MySQL 조회 | <span class="pill warn">높음</span> |
-| 모듈 최상단 | 공통 모듈 import (`trino`, `helper` 등) | 1회 | <span class="pill info">모듈에 따라 다름</span> |
+| `create_dag` 내부 | `ensure_pool(...)` | **N회**. 메타 DB 조회나 쓰기로 추정 | <span class="pill bad">매우 높음</span> |
+| `create_dag` 내부 | `get_schedule()` | **N회**. Variable 조회라면 메타 DB 접근 | <span class="pill bad">확인 필요</span> |
+| `create_dag` 내부 | `TriggerAndWait`(선행·후행 DAG 실행 오퍼레이터), `AwsGlueJobOperator` 생성자 | N회씩. 생성자에서 boto3나 DB를 부르면 치명적 | <span class="pill warn">확인 필요</span> |
+| 모듈 최상단 | `get_secret(...)` | 1회. AWS SSM API 호출 | <span class="pill warn">높음</span> |
+| 모듈 최상단 | `load_source_config()` | 1회. 서브쿼리가 있는 MySQL 조회 | <span class="pill warn">높음</span> |
+| 모듈 최상단 | 공통 모듈 import (`trino`, DB 헬퍼 등) | 1회 | <span class="pill info">모듈에 따라 다름</span> |
 
 </div>
 
@@ -134,10 +134,10 @@ def create_dag(dag_id, default_args, db_config):
 
 ```bash
 airflow dags report                                              # 파일별 파싱 시간
-python -m cProfile -s cumtime dags/intake_pyspark_v4.py 2>&1 | head -40
+python -m cProfile -s cumtime dags/ingest_dag.py 2>&1 | head -40
 ```
 
-`create_group_pool`, `get_ssm_parameter`, `helper.query`, 각 Operator의 `__init__`이 상위에 나오는지 확인합니다.
+`ensure_pool`, `get_secret`, `db.query`, 각 Operator의 `__init__`이 상위에 나오는지 확인합니다.
 
 ## 4. 부하와 별개로 발견한 문제 {#bugs}
 
@@ -145,9 +145,9 @@ python -m cProfile -s cumtime dags/intake_pyspark_v4.py 2>&1 | head -40
 
 | 문제 | 원인 | 영향 |
 | --- | --- | --- |
-| <span class="pill bad">전체 소실</span> DB 장애 시 DAG 300개가 사라짐 | `load_log_config()`가 예외를 삼키고 `None`을 반환 → `for item in items`에서 `TypeError` | 파일 import 실패. MySQL이 잠깐만 흔들려도 모든 intake DAG이 UI에서 사라짐 |
-| <span class="pill warn">확인 필요</span> pre/post hook이 항상 비어 있음 | SQL이 `pre_hook`, `post_hook` 컬럼을 조회하지 않음 → 항상 기본값 `'{}'` | `target_dag_id=''`. 선행·후행 DAG 연결이 동작하지 않음 |
-| <span class="pill warn">개선</span> 실패 콜백이 다시 실패할 수 있음 | `task_failure_function`에서 context에 `exception`이 없으면 `str_exception`이 정의되지 않음 | `UnboundLocalError`로 실패 알림이 안 감 |
+| <span class="pill bad">전체 소실</span> DB 장애 시 DAG 300개가 사라짐 | `load_source_config()`가 예외를 삼키고 `None`을 반환 → `for item in items`에서 `TypeError` | 파일 import 실패. MySQL이 잠깐만 흔들려도 모든 intake DAG이 UI에서 사라짐 |
+| <span class="pill warn">확인 필요</span> pre/post hook이 항상 비어 있음 | SQL이 선행·후행 DAG 설정 컬럼을 조회하지 않음 → 항상 빈 기본값 | 선행·후행 DAG id가 빈 문자열. 선행·후행 DAG 연결이 동작하지 않음 |
+| <span class="pill warn">개선</span> 실패 콜백이 다시 실패할 수 있음 | 실패 콜백에서 context에 `exception`이 없으면 예외 메시지 변수가 정의되지 않음 | `UnboundLocalError`로 실패 알림이 안 감 |
 | <span class="pill warn">개선</span> Airflow 1 스타일 import | `python_operator`, `dummy_operator`, `provide_context` | 버전 업그레이드 시 깨짐. `get_parsing_context()` 사용 가능 여부도 버전에 달림 |
 | <span class="pill info">참고</span> 오류 메시지 불일치 | MySQL을 조회하면서 "pymssql 연결 오류"를 로그로 남김 | 장애 분석 시 혼란 |
 
@@ -165,13 +165,12 @@ pool은 DAG을 만들 때마다 만들 필요가 없습니다. 이름만 쓰고,
 
 ```python
 # 모듈 레벨에서 1회만
-GROUP_NAME = 'intake_group'
-POOL_NAME = 'intake_group_pool'               # create_group_pool이 만드는 이름 규칙에 맞춤
-SCHEDULE_INTERVAL = get_schedule_interval()   # Variable 조회라면 N회 → 1회
+POOL_NAME = "intake_group_pool"   # 이름만 사용. 생성은 배포 단계에서 한 번
+SCHEDULE = get_schedule()         # Variable 조회라면 N회 → 1회
 
-def create_dag(dag_id, default_args, db_config):
+def create_dag(dag_id, default_args, cfg):
     ...
-    # pool_name = create_group_pool(group_name, ...)[0]   ← 삭제
+    # pool = ensure_pool(cfg["group"], ...)   ← 삭제
     submit_glue_job = AwsGlueJobOperator(..., pool=POOL_NAME, ...)
 ```
 
@@ -183,11 +182,11 @@ def create_dag(dag_id, default_args, db_config):
 from functools import lru_cache
 
 @lru_cache(maxsize=1)
-def get_de_common_pwd():
-    return config.get_ssm_parameter("/<env>/application/.../app")
+def audit_password():
+    return get_secret("/<env>/audit/password")
 
-# 사용처: DE_COMMON_PWD → get_de_common_pwd()
-sends_task_log_to_es(OPENSEARCH_URL, DE_COMMON_USER, get_de_common_pwd(), context, "do_final")
+# 사용처: AUDIT_PASSWORD → audit_password()
+send_audit_log(AUDIT_URL, AUDIT_USER, audit_password(), context, "do_final")
 ```
 
 ### ③ 워커에서는 필요한 DAG 하나만 만들기
@@ -208,7 +207,7 @@ def _current_dag_id():
 CURRENT_DAG_ID = _current_dag_id()
 
 for item in items:
-    dag_id = '{}_{}_{}_workflow'.format(item['service'], item['component'], item['log_name'])
+    dag_id = "ingest_" + item["source_id"]
     if CURRENT_DAG_ID and CURRENT_DAG_ID != dag_id:
         continue                     # 워커에서는 DAG 300개 대신 1개만 생성
     globals()[dag_id] = create_dag(dag_id, default_args_for(item), item)
@@ -217,16 +216,16 @@ for item in items:
 ### ④ 설정은 캐시에서 읽고, 장애 시 마지막 캐시로 버티기
 
 ```python
-CACHE = Path(__file__).parent / "configs" / "intake_log_config.json"
+CACHE = Path(__file__).parent / "configs" / "source_config.json"
 
-def load_log_config():
+def load_source_config():
     try:
-        rows = helper.query(SQL)
+        rows = db.query(SQL)
         CACHE.parent.mkdir(exist_ok=True)
         CACHE.write_text(json.dumps(rows, default=str))   # 성공하면 캐시 갱신
         return rows
     except Exception:
-        logger.exception("log_config 조회 실패, 캐시 사용")
+        logger.exception("설정 조회 실패, 캐시 사용")
         return json.loads(CACHE.read_text()) if CACHE.exists() else []
 ```
 
@@ -239,18 +238,19 @@ def load_log_config():
 `(a, b, c, d) IN (서브쿼리)` 형태를 JOIN으로 바꾸고, 최신 row를 찾는 인덱스를 둡니다.
 
 ```sql
-SELECT c.owner_corp, c.department, r.service, r.component, r.log_name, r.created_at, r.log_version
-FROM log_register r
+-- 예시 스키마: 키 (domain, source, dataset), 같은 키에 버전별 row가 쌓임
+SELECT c.owner, r.domain, r.source, r.dataset, r.created_at, r.version
+FROM source_registry r
 JOIN (
-    SELECT service, component, log_name, MAX(created_at) AS max_created_at
-    FROM log_register
-    GROUP BY service, component, log_name
-) m ON r.service = m.service AND r.component = m.component
-   AND r.log_name = m.log_name AND r.created_at = m.max_created_at
-JOIN log_category c
-  ON r.service = c.service AND r.component = c.component AND r.log_name = c.log_name;
+    SELECT domain, source, dataset, MAX(created_at) AS max_created_at
+    FROM source_registry
+    GROUP BY domain, source, dataset
+) m ON r.domain = m.domain AND r.source = m.source
+   AND r.dataset = m.dataset AND r.created_at = m.max_created_at
+JOIN source_category c
+  ON r.domain = c.domain AND r.source = c.source AND r.dataset = c.dataset;
 
-CREATE INDEX idx_log_register_latest ON log_register (service, component, log_name, created_at);
+CREATE INDEX idx_source_registry_latest ON source_registry (domain, source, dataset, created_at);
 ```
 
 ### 당장 장애를 막는 임시 조치
@@ -306,13 +306,13 @@ parsing_processes = 4
 ### 권장 형태: 얇은 DAG 파일 + 공통 factory
 
 ```python
-# dags/intake/svc_a_comp_b_log_c.py  ← 생성기가 만드는 파일 (airflow DAG)
+# dags/intake/dom_a_src_b_ds_c.py  ← 생성기가 만드는 파일 (airflow DAG)
 from intakes.factory import create_intake_dag
 
 dag = create_intake_dag({
-    "service": "svc_a", "component": "comp_b", "log_name": "log_c",
-    "owner_corp": "<corp>", "department": "<dept>",
-    "created_at": "2026-03-01T00:00:00", "log_version": "v2",
+    "domain": "dom_a", "source": "src_b", "dataset": "ds_c",
+    "owner": "<owner>",
+    "created_at": "2026-03-01T00:00:00", "version": "v2",
 })
 ```
 
@@ -362,7 +362,7 @@ def create_intake_dag(cfg: dict) -> DAG:
 def all_intakes():
     @task
     def get_configs():
-        return MySqlHook("mysql_conn").get_records("SELECT ... FROM log_register ...")  # 런타임에만 조회
+        return MySqlHook("mysql_conn").get_records("SELECT ... FROM source_registry ...")  # 런타임에만 조회
 
     @task(pool="intake_group_pool")
     def run_intake(cfg): ...
@@ -380,7 +380,7 @@ Dynamic Task Mapping은 파싱 비용이 설정 수와 무관해집니다. 대�
 <span class="when">즉시</span>
 ### 소실 방지
 
-`load_log_config()` 실패 시 캐시로 대체(④), 필요하면 `dagbag_import_timeout` 상향. 실패 콜백의 `UnboundLocalError` 수정.
+`load_source_config()` 실패 시 캐시로 대체(④), 필요하면 `dagbag_import_timeout` 상향. 실패 콜백의 `UnboundLocalError` 수정.
 </div>
 
 <div class="step" markdown="1">
@@ -424,7 +424,7 @@ factory 모듈 + 생성기로 DAG 파일 N개 생성(6장). pre/post hook 컬럼
 | 비용 절감 | 입수할 데이터가 없으면 Glue 실행을 건너뜀 |
 | 동시성 제어 | pool로 Glue 동시 실행을 20개로 제한해, 대상이 늘어도 Glue 한도를 넘지 않음 |
 | 테이블 관리 | 다음 날짜의 실시간 조회용 파티션 생성, 보관 기간(7일)이 지난 실시간 로그 삭제, 데이터가 없는 날의 빈 파티션 삭제를 자동으로 처리 |
-| 품질 관리 | 적재 후 Trino `ANALYZE`로 통계 갱신, 파일·데이터 크기를 `log_stats`에 기록, 적재 건수가 0이면 이상 이벤트 기록 |
+| 품질 관리 | 적재 후 Trino `ANALYZE`로 통계 갱신, 파일·데이터 크기를 `ingest_stats`에 기록, 적재 건수가 0이면 이상 이벤트 기록 |
 | 감사·추적 | 성공, 실패, 건너뜀, 종료를 OpenSearch에 태스크 단위로 기록 |
 | 재처리 | 수동 실행 시 날짜(`--DT`)와 Glue 리소스를 덮어써 대상 하나만 다시 처리. 이때는 실시간 파티션 정책을 건드리지 않음 |
 
