@@ -38,7 +38,8 @@ Kafka Connect upsert 커넥터의 커밋 경합을 피하려고 전환한 구조
 5. [mdp-batch-writer 검토](#batch)
 6. [개선안과 코드 예시](#fix)
 7. [우선순위](#plan)
-8. [참고](#refs)
+8. [성과와 기대 효과](#outcome)
+9. [참고](#refs)
 
 </div>
 
@@ -489,9 +490,57 @@ S6 merge-on-read 전환 + 컴팩션(앞 문서 7장), 또는 `bucket(id_id)`. �
 > 이 구조가 직접 해결하려는 문제, 즉 단일 committer, 주기적 커밋, exactly-once는 공식 Iceberg Kafka Connect Sink가 기본으로 제공합니다. 버퍼와 배치 두 컴포넌트를 계속 유지보수하는 비용과 비교해 보세요. log 테이블 적재를 공식 Sink로 바꾸고 mirror만 Spark `MERGE` 배치로 두면, 3장의 넘겨받기 문제와 B 계열 이슈가 함께 사라집니다. 이 경우 Sink의 upsert 지원 여부와는 무관합니다. log 테이블은 append만 하기 때문입니다.
 {: .callout .info}
 
+## 8. 성과와 기대 효과 {#outcome}
+
+### 기존 구현의 성과
+
+커밋 경합을 없애려고 적재 구조를 바꾼 결과입니다.
+
+<div class="table-wrap" markdown="1">
+
+| 구분 | 이전 (upsert 커넥터) | 전환 후 (buffer + Spark 배치) |
+| --- | --- | --- |
+| 테이블당 커밋 주체 | 최대 8개 task | <span class="pill ok">1</span> 배치 job |
+| 커밋 빈도 | 몇 초마다 | <span class="pill ok">10분에 테이블당 2~3회</span> |
+| equality delete | 레코드마다 | <span class="pill ok">0</span> log는 append, mirror는 CoW `MERGE` |
+| 재처리 | upsert 멱등성에 의존 | <span class="pill ok">결정적 파일명 + 파티션 덮어쓰기</span> 같은 윈도우를 다시 돌려도 중복 없음 |
+| 원본 보존 | 없음 | <span class="pill ok">S3 버퍼</span> Iceberg와 별개로 원본 이벤트를 Parquet로 보관. 백필과 누락 점검의 기준 |
+| 장애 처리 | 반쪽 파일, 고아 파일 | <span class="pill ok">multipart upload abort</span> checkpoint보다 뒤처지면 따라잡기, 백필 경로 분리 |
+
+</div>
+
+앞 문서에서 권장한 "append 먼저, merge는 나중에" 구조를 실제로 운영에 옮겼고, 커밋 경합과 equality delete 누적이라는 두 문제를 함께 없앴습니다.
+
+### 개선을 적용하면 얻는 것
+
+아래 수치는 코드와 운영 설정에서 계산한 예상치입니다. 적용 후 측정값으로 바꿉니다.
+
+<div class="table-wrap" markdown="1">
+
+| 개선 | 지표 | 지금 | 적용 후 (예상) | 근거 |
+| --- | --- | --- | --- | --- |
+| 파일 단위 증분 처리 (또는 B1 + S1) | 늦게 도착한 버퍼 파일의 누락 | 오류 없이 누락 가능 | <span class="pill ok">0</span> 버퍼와 log 건수 일치 | 3장 |
+| B2 offset 커밋 수정 | 타임스탬프 역전 시 유실 | 재시작·리밸런싱 때 발생 가능 | <span class="pill ok">0</span> | 4장 |
+| S2 MERGE 원본 쿼리 | mirror에 반영되지 않는 변경 | 세 컬럼 `max`가 엇갈리면 누락 | <span class="pill ok">0</span> 키별 `row_number` 1건 | 5장 |
+| S2 MERGE 원본 쿼리 | MERGE가 읽는 log 범위 | 누적 전체, 시간이 갈수록 증가 | <span class="pill ok">10분 윈도우 하나</span> 실행 시간이 운영 기간과 무관해짐 | 5장 |
+| S3 순서 값 재인코딩 | 같은 초에 ord ≥ 1000일 때 순서 역전·값 충돌 | 대량 변경 시 발생 | <span class="pill ok">0</span> | 5장 |
+| S4 버전 비교 | 늦게 온 과거 변경이 최신 상태를 덮어씀 | 백필·지연 시 발생 | <span class="pill ok">0</span> 처리 순서와 무관한 결과 | 5장 |
+| S5 타입 통일 + 테이블 단위 격리 | 한 컬렉션의 타입 혼재로 멈추는 범위 | 같은 실행의 모든 테이블 | <span class="pill ok">그 테이블 하나</span> | 5장 |
+| S7 일 파티션 | log 테이블 파티션 수 | 연간 약 52,000개 | <span class="pill ok">연간 365개</span> | 5장 |
+| S8 중복 실행 방지 | 같은 테이블에 MERGE하는 driver | pod 재시작 시 2개 가능 | <span class="pill ok">항상 1개</span> | 5장 |
+| log 적재를 공식 Sink로 (대안) | 운영 구성요소 | 커넥터, S3 버퍼, CronJob, Kyuubi, checkpoint | <span class="pill ok">Sink + mirror MERGE 배치</span> 넘겨받기 문제 자체가 사라짐 | 7장 |
+| 최신성 | mirror 반영 지연 | 15~25분 | <span class="pill warn">그대로</span> 이번 개선의 목표가 아님 | 2장 |
+
+</div>
+
+> **측정 방법**
+>
+> 3장의 버퍼 대비 log 건수 비교를 윈도우마다 자동으로 돌리면, 누락이 0인지를 매일 확인하는 지표가 됩니다. 여기에 버퍼 데이터의 `max(source.ord)`, MERGE 실행 시간 추이, 실행별 실패 테이블 수를 함께 기록합니다.
+{: .callout .info}
+
 * * *
 
-## 8. 참고 {#refs}
+## 9. 참고 {#refs}
 
 - 앞 문서: [Iceberg 커밋 경합 리뷰](/2026/10/08/iceberg-commit-conflict-review.html)
 - [Apache Iceberg: Spark Writes (MERGE INTO, overwritePartitions)](https://iceberg.apache.org/docs/latest/spark-writes/)

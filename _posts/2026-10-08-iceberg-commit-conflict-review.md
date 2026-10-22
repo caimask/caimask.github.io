@@ -7,7 +7,7 @@ author: caimask
 
 MongoDB CDC 이벤트를 Kafka에서 Iceberg로 적재하던 자체 개발 Sink Connector가 느렸던 원인을 짚고, "Iceberg도 이제 row lock으로 처리된다"는 정보가 맞는지, 그리고 대용량 데이터를 빠르게 적재하려면 어떤 방식을 써야 하는지 정리한 문서입니다.
 
-작성 2026-10-08 · 대상 커넥터 v1.3.1 · Iceberg 1.4.3 · Glue Catalog
+작성 2026-10-08 · 보강 2026-10-22 · 대상 커넥터 v1.3.1 · Iceberg 1.4.3 · Glue Catalog
 {: .meta}
 
 <div class="summary" markdown="1">
@@ -20,6 +20,7 @@ MongoDB CDC 이벤트를 Kafka에서 Iceberg로 적재하던 자체 개발 Sink 
 4. **처리량과 커밋 빈도는 별개입니다**: 대용량 적재의 표준은 **병렬 writer + 테이블당 단일 committer + 1~5분 커밋**입니다. 커밋 직렬화가 정하는 것은 데이터 최신성의 하한이지 처리량이 아닙니다.
 5. **최적화가 감당이 안 됐던 이유**: 파일 수는 커밋 횟수에 비례하므로 커밋을 묶으면 크게 줄어듭니다. 하지만 근본 원인은 **equality delete가 파티션 없는 mirror 테이블 전체에 걸리는 것**이라, bucket 파티션이나 MERGE 구조 전환과 증분 컴팩션 운영이 함께 필요합니다.
 6. **삭제 방식은 테이블 성격에 맞춰 고릅니다**: equality delete는 쓰기가 빠른 대신 읽기와 컴팩션 비용이 크고, position delete(v3에서는 deletion vector)와 copy-on-write는 쓰기 시점에 비용을 더 냅니다. 현재 커넥터는 신규 insert에도 equality delete를 쓰고 있어, log 테이블에서는 대부분 불필요한 비용입니다.
+7. **직접 구현한 이유는 당시 공식 커넥터의 공백이었습니다**: 2023년 8월에는 MongoDB 이벤트와 사내 이벤트 모델을 받아 주는 공식 커넥터가 없어, getindata 커넥터를 참고해 직접 만들었습니다. 그때 `put()`마다 커밋하는 구조를 함께 물려받았고, 공식 커넥터의 **테이블당 단일 committer**가 빠졌습니다. Apache 공식 커넥터는 지금도 upsert를 지원하지 않습니다.
 
 </div>
 
@@ -34,8 +35,10 @@ MongoDB CDC 이벤트를 Kafka에서 Iceberg로 적재하던 자체 개발 Sink 
 5. [대용량 실시간 적재 권장 방식](#scale)
 6. [Iceberg 삭제 방식 비교](#deletes)
 7. [테이블 운영 최적화](#ops)
-8. [이 프로젝트 적용안](#plan)
-9. [참고 자료](#refs)
+8. [공식 커넥터와의 차이](#official)
+9. [이 프로젝트 적용안](#plan)
+10. [성과와 기대 효과](#outcome)
+11. [참고 자료](#refs)
 
 </div>
 
@@ -270,7 +273,7 @@ Databricks의 row-level concurrency는 **Delta Lake 테이블 기능**입니다(
 
 > **공식 Kafka Connect Sink 도입 전 확인**
 >
-> 원본인 Tabular 버전은 upsert 모드를 명시적으로 지원했지만, Apache 버전 문서에서는 upsert 지원 여부를 확인하지 못했습니다. 배포할 버전에서 upsert와 delete 동작을 꼭 검증하세요.
+> 원본인 Tabular 버전은 upsert 모드를 명시적으로 지원했지만, Apache 버전은 기증 과정에서 upsert가 빠졌고 최신 문서에도 설정 키가 없습니다(2026-10 확인). 그래서 Apache 버전은 append 테이블에만 씁니다. 자세한 차이는 8장에 있습니다.
 {: .callout .warn}
 
 ### 공식 Kafka Connect Sink 관련 링크
@@ -548,7 +551,110 @@ equality delete 파일(content=2) 수가 data 파일 수에 가깝거나 더 많
 
 1~2단계만으로도 체감이 크게 달라질 것입니다. 3~4단계는 테이블 규모와 업데이트 비율을 측정한 뒤 결정합니다.
 
-## 8. 이 프로젝트 적용안 {#plan}
+## 8. 공식 커넥터와의 차이 {#official}
+
+**질문** Databricks(Tabular)와 Apache의 공식 Kafka Connect Sink가 있는데, 왜 직접 구현했나? 둘은 무엇이 다른가?
+{: .q}
+
+자체 커넥터는 [getindata/kafka-connect-iceberg-sink](https://github.com/getindata/kafka-connect-iceberg-sink)를 참고해 만들었습니다. 설정 키(`upsert`, `upsert.keep-deletes`, `upsert.op-column`, `allow-field-addition`, `table.*`, `iceberg.partition.*`)와 "`put()`마다 테이블별로 커밋하는 구조"가 여기서 왔습니다. 공식 커넥터는 이와 다른 계보로, Tabular가 만든 커넥터가 Databricks 저장소를 거쳐 Apache Iceberg에 기증된 것입니다.
+
+### 구현 당시의 선택지
+
+<div class="table-wrap" markdown="1">
+
+| 시점 | 일 |
+| --- | --- |
+| 2022-03 | getindata 커넥터 공개. Debezium 이벤트를 받아 `put()`마다 커밋하는 구조 |
+| 2023-05 | Tabular 커넥터 0.1.0 공개. upsert 모드는 처음부터 있음 |
+| **2023-08-31** | **자체 커넥터 개발 시작** (MDP-37, Iceberg 1.2.1, getindata 참고) |
+| 2023-09-19 | Tabular에 CDC/upsert용 ID 컬럼 설정 추가 (0.4.x → 0.5) |
+| 2023-11 ~ 12 | 자체 커넥터 운영 대응: MDP-274(create에도 delete 선행), MDP-318(테이블별 병렬 처리 시도 후 원복) |
+| 2024-04-23 | Tabular에 MongoDB Debezium SMT가 처음 추가됨 |
+| 2024-11 | Apache Iceberg 1.7.0에 Kafka Connect Sink 포함. **upsert는 빠짐** |
+| 2024-12-26 | 자체 커넥터 archive (MDP-610) |
+| 2026-08 | Apache에 기증 전 upsert 기능을 되살리자는 이슈([#17542](https://github.com/apache/iceberg/issues/17542))가 올라옴. 이 문서를 고친 시점에 아직 열려 있음 |
+
+</div>
+
+개발을 시작할 때 Tabular 커넥터는 나온 지 3개월 된 0.4.x였고, MongoDB 이벤트를 해석하는 기능이 없었습니다. Apache 버전은 아직 없었습니다.
+
+### 세 커넥터 비교
+
+<div class="table-wrap" markdown="1">
+
+| 항목 | 자체 커넥터 | Tabular (`io.tabular.*`) | Apache (`org.apache.iceberg.connect.*`) |
+| --- | --- | --- | --- |
+| 커밋 주체 | <span class="pill bad">task마다</span> `put()`마다 테이블별 `rowDelta.commit()` (`IcebergUtil.java:109`) | <span class="pill ok">테이블당 1</span> coordinator가 control topic으로 모아 커밋 | Tabular와 같음. `commit.interval-ms` 기본 5분 |
+| 전달 보장 | at-least-once. upsert라 재처리해도 결과가 같음 | exactly-once (KIP-447) | 같음 |
+| upsert | 항상 delete 후 write (`DeltaTaskWriter.java:61-80`) | `upsert-mode-enabled`, `cdc-field` | <span class="pill bad">없음</span> 설정 키가 없음 |
+| 삭제 이벤트 | `upsert.keep-deletes=true`면 행을 지우지 않고 `__op=d`로 남김 | 행을 삭제 | 해당 없음 |
+| MongoDB 이벤트 | BSON 문자열인 `after`를 직접 파싱. `updateDescription` 유무로 UPDATE와 REPLACE 구분 | 2024-04 이전에는 없음 | `MongoDebeziumTransform` (Experimental) |
+| 변경 메타데이터 | `__updated_fields`, `__removed_fields`, `__source_ts_ms_ord`, `__event_ts_ms`, `__kafka_ts_ms` | `_cdc.op`, `_cdc.ts`, `_cdc.source` 등 | 같음 |
+| 작업 코드 | 사내 protobuf `OperationType`에 맞춤 (MDP-245) | Debezium의 c/u/d | 같음 |
+| 테이블 결정 | `table.name.rule`(`{database}_{table}`), 컬렉션 include/exclude 목록 | `route-regex` 또는 `route-field` | 같음 |
+| 필드명 | snake_case로 변환 | 원래 이름 그대로 | 같음 |
+| 스키마 진화 | 레코드마다 비교. 한 배치 안의 문서 스키마가 제각각이라 스키마별로 묶지 않음 (`IcebergUtil.java:53` 주석) | `evolve-schema-enabled` | 같음 |
+| 변환 실패 | `exception.message.skippable`로 건너뛸 수 있음 | 확인 못 함 | 확인 못 함 |
+| 운영 요소 | 커넥터만 있으면 됨 | control topic, 별도 consumer group | 같음 |
+
+</div>
+
+### 직접 구현한 이유
+
+1. **MongoDB 이벤트를 받아 주는 공식 커넥터가 없었습니다.** MDP 이벤트의 `after`는 BSON 문자열이고, Kafka 키인 `_id`도 JSON 문자열(`unique_key_set`, `type_name`)입니다. getindata와 Tabular 모두 Debezium의 관계형 DB 이벤트 형식을 기준으로 만들어져, 이 형식을 해석하지 못했습니다. Tabular에 Mongo용 SMT가 생긴 것은 자체 커넥터를 운영하던 2024-04입니다.
+2. **변환 규칙이 사내 데이터 모델에 맞춰져 있습니다.** REPLACE 구분, protobuf 작업 코드, `__updated_fields`/`__removed_fields`, soft delete, snake_case 변환이 그렇습니다. 지금 공식 SMT로도 대부분 만들 수 없습니다. 실제로 변환기(`MongoEventToRecordConverter`)가 전체 코드 1,905줄 중 486줄로 가장 큽니다.
+3. **upsert가 필요했는데, 공식 계열은 아직 초기였습니다.** 당시 Tabular 커넥터는 0.x였습니다. Apache 버전은 지금도 upsert를 지원하지 않습니다.
+4. **참고한 구현이 getindata였습니다.** 그래서 coordinator 없이 `put()`마다 커밋하는 구조도 함께 물려받았습니다. 이 문서에서 다룬 커밋 경합은 공식 커넥터를 쓰지 않아서 생긴 것이라기보다, **출발점이 된 코드의 커밋 모델**에서 생긴 것입니다.
+
+### 운영 중 바꾼 것
+
+<div class="findings" markdown="1">
+
+<div class="finding" markdown="1">
+
+### <span class="id">MDP-274</span> create 이벤트에도 delete 선행 (2023-11)
+
+DeltaTaskWriter.java:61-80
+{: .where}
+
+- **배경**: 처음에는 create 이벤트면 기존 데이터가 없다고 보고 delete 없이 write만 했습니다. 그런데 Kafka offset을 되돌려 이벤트를 다시 처리하면, 이미 적재한 create 이벤트가 다시 들어옵니다. 그래서 upsert가 필요한 경우 create에도 같은 키로 delete를 먼저 하도록 바꿨습니다.
+- **평가**: at-least-once 구조에서 재처리 결과를 같게 만드는 올바른 판단이었습니다. 다만 그 대가로 모든 신규 행에 equality delete가 하나씩 붙게 되었고, 6장에서 지적한 log 테이블의 불필요한 비용이 여기서 생깁니다.
+- **공식 커넥터라면**: exactly-once라 재처리 중복이 생기지 않으므로 append 테이블에는 이 delete가 필요 없습니다. at-least-once를 유지한다면 log 테이블은 `upsert=false`로 두고 조회나 MERGE 단계에서 `(_oid, __source_ts_ms_ord)`로 중복을 제거하는 편이 저렴합니다.
+
+</div>
+
+<div class="finding" markdown="1">
+
+### <span class="id">MDP-318</span> 테이블별 병렬 처리 시도 후 원복 (2023-12)
+
+IcebergSinkTask.java · IcebergTableWriteWorker.java (원복으로 삭제됨)
+{: .where}
+
+- **배경**: 한 배치에 여러 테이블의 이벤트가 오면 테이블을 하나씩 차례로 처리했습니다. 처리 시간을 줄이려고 테이블마다 스레드로 병렬 처리하는 로직을 넣었지만, 병렬 처리로 인한 에러가 더 많아 원래대로 되돌렸습니다.
+- **평가**: 테이블이 다르면 커밋이 완전히 병렬이므로(2장), 방향 자체는 맞았습니다. 하지만 느렸던 핵심 원인은 **같은 테이블**에 여러 task와 커넥터가 몇 초마다 커밋을 다투는 것이었습니다. 한 task 안에서 테이블을 나눠 병렬로 처리해도 이 경합은 줄어들지 않습니다.
+- **공식 커넥터라면**: 같은 생각을 coordinator 한 곳에서 합니다. 테이블당 커밋은 coordinator 하나만 하고, 여러 테이블의 커밋을 `iceberg.control.commit.threads`(기본 코어 수 × 2)로 병렬 처리합니다. 테이블 간 병렬은 살리고 테이블 내 경합은 없애는 구조입니다.
+
+</div>
+
+</div>
+
+### 지금 공식 커넥터로 옮긴다면
+
+<div class="table-wrap" markdown="1">
+
+| 테이블 | 공식 커넥터 적용 | 남는 작업 |
+| --- | --- | --- |
+| `repo_cdc_log_*` | <span class="pill ok">가능</span> Apache 버전으로 append. exactly-once라 equality delete가 필요 없음 | `MongoDebeziumTransform`은 Experimental. 사내 메타데이터 필드, REPLACE 구분, snake_case 변환은 직접 만든 SMT로 옮겨야 함 |
+| `repo_cdc_mirror_*` | <span class="pill bad">어려움</span> Apache 버전에 upsert가 없음 | log 테이블에서 주기적으로 `MERGE`하는 job으로 전환 (9장). Tabular 포크는 유지보수가 끊겼고, 같은 커밋 안 equality delete 중복 문제를 직접 막아야 함 |
+
+</div>
+
+> **정리**
+>
+> 직접 구현한 것은 공식 커넥터를 두고 고르지 않은 것이 아니라, 2023년 8월에 MongoDB와 사내 이벤트 모델을 받아 주는 공식 커넥터가 없었기 때문입니다. 대신 getindata의 커밋 모델을 함께 가져오면서, 공식 커넥터의 핵심인 **테이블당 단일 committer**가 빠졌습니다. 지금 옮긴다면 변환 로직은 SMT로 살리고 커밋은 공식 커넥터에 맡기는 방식이 됩니다.
+{: .callout .info}
+
+## 9. 이 프로젝트 적용안 {#plan}
 
 <div class="steps" markdown="1">
 
@@ -606,9 +712,51 @@ log 테이블은 공식 Iceberg Kafka Connect Sink 또는 Flink로 append합니�
 
 먼저 하위 소비자에게 분 단위 최신성이면 충분한지 확인해야 합니다. 그 답에 따라 Iceberg 단독으로 갈지, 실시간 계층을 함께 둘지가 정해집니다.
 
+## 10. 성과와 기대 효과 {#outcome}
+
+### 기존 구현의 성과
+
+<div class="table-wrap" markdown="1">
+
+| 구분 | 성과 |
+| --- | --- |
+| 파이프라인 구축 | MongoDB CDC 이벤트를 Kafka에서 Iceberg(Glue Catalog)로 적재하는 Kafka Connect sink를 직접 개발해 운영. 커넥터 4종으로 컬렉션별 mirror 테이블과 log 테이블을 함께 유지 |
+| 테이블 설계 | 최신 상태(`repo_cdc_mirror_*`)와 변경 이력(`repo_cdc_log_*`)을 나눔. log 테이블 키에 `__source_ts_ms_ord`를 넣어, 커밋 주기와 상관없이 변경 하나하나를 행으로 보존하는 구조 |
+| 최신성 | 경합이 없을 때 수 초 단위로 데이터 레이크에 반영 |
+| 정합성 | 같은 배치 안의 중복 키를 position delete로 정확히 처리. 실패 시 offset 커밋을 막아 at-least-once를 보장하고, upsert라 재처리해도 결과가 같음 |
+| 운영 편의 | 새 필드가 들어오면 테이블 스키마를 자동으로 확장 |
+
+</div>
+
+### 개선을 적용하면 얻는 것
+
+아래 수치는 운영 설정과 코드에서 계산한 예상치입니다. 적용 후 실제 측정값으로 바꿉니다.
+
+<div class="table-wrap" markdown="1">
+
+| 개선 | 지표 | 지금 | 적용 후 (예상) | 근거 |
+| --- | --- | --- | --- | --- |
+| 커밋 묶기 + 단일 committer | major mirror 테이블당 커밋 | 몇 초마다, writer 최대 8개가 경쟁 | <span class="pill ok">1~5분에 1회</span> | 5장 |
+| 커밋 묶기 | 커밋 재시도와 backoff | 상시 발생 | <span class="pill ok">거의 없음</span> 경쟁 주체가 하나 | 2장 |
+| 커밋 묶기 | 처리량 확장 | 커밋 경쟁에 묶임 | <span class="pill ok">writer 수에 비례</span> | 5장 |
+| 커밋 묶기 | data·delete·manifest·metadata 파일 수 | 커밋마다 생성 | <span class="pill ok">수십~수백 분의 1</span> 몇 초 → 5분 | 7장 |
+| 테이블 캐시 + `refresh()` | Glue GetTable, metadata.json 읽기 | `put()`마다 | <span class="pill ok">커밋 주기마다</span> | 1장 |
+| log 테이블 append 전환 | log 테이블 equality delete | 레코드마다 1행 | <span class="pill ok">0</span> | 6장 |
+| `bucket(16, _oid)` 파티션 | equality delete와 컴팩션 범위 | 테이블 전체 | <span class="pill ok">1/16</span> | 7장 |
+| 증분 컴팩션 + `partial-progress` | 최적화 작업 | 테이블 전체를 한 번에 다시 쓰다 커밋 직전에 실패 | <span class="pill ok">작은 커밋 여러 번</span> 실패해도 끝난 그룹은 유지 | 7장 |
+| mirror를 log 기반 `MERGE`로 전환 + v3 | mirror delete 파일 | 계속 누적 | <span class="pill ok">data 파일당 deletion vector 1개</span> | 7장 |
+| 커밋 주기 | 최신성 | 수 초 (경합이 없을 때) | <span class="pill warn">1~5분</span> 대가로 내주는 것 | 5장 |
+
+</div>
+
+> **측정 방법**
+>
+> 7장의 `files`, `snapshots` 메타데이터 쿼리로 delete 파일 비율, 평균 파일 크기, 시간당 커밋 수를 적용 전후로 비교합니다. 커넥터의 consumer lag과 커밋 1회 소요 시간도 함께 기록하면, 처리량이 커밋 경합에서 풀려났는지 확인할 수 있습니다.
+{: .callout .info}
+
 * * *
 
-## 9. 참고 자료 {#refs}
+## 11. 참고 자료 {#refs}
 
 - [Apache Iceberg: Kafka Connect (latest)](https://iceberg.apache.org/docs/latest/kafka-connect/) · [nightly](https://iceberg.apache.org/docs/nightly/kafka-connect/)
 - [apache/iceberg: kafka-connect 소스 (공식, 현재 관리)](https://github.com/apache/iceberg/tree/main/kafka-connect)
@@ -623,5 +771,7 @@ log 테이블은 공식 Iceberg Kafka Connect Sink 또는 Flink로 append합니�
 - [Apache Iceberg: Spark Procedures (유지보수 프로시저)](https://iceberg.apache.org/docs/latest/spark-procedures/)
 - [Apache Iceberg: Maintenance](https://iceberg.apache.org/docs/latest/maintenance/)
 - [databricks/iceberg-kafka-connect](https://github.com/databricks/iceberg-kafka-connect) (구 tabular-io, 유지보수 중단)
+- [getindata/kafka-connect-iceberg-sink](https://github.com/getindata/kafka-connect-iceberg-sink) (자체 커넥터가 참고한 구현, archived)
+- [apache/iceberg#17542: Kafka Connect upsert/delete 지원 복원](https://github.com/apache/iceberg/issues/17542) · [#15046: Apache 버전 upsert 중복 문의](https://github.com/apache/iceberg/issues/15046)
 - [Why Iceberg V4 wants to retire equality deletes](https://datalakehousehub.com/blog/equality-deletes-iceberg-v4)
 - [Surviving commit conflicts when dozens of writers hit the same Iceberg table](https://datalakehousehub.com/blog/iceberg-concurrent-commits-agents)

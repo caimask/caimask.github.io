@@ -30,7 +30,8 @@ MySQL 테이블을 5초마다 조회해 Kafka 토픽으로 보내던 Logstash �
 3. [이 방식의 한계](#limits)
 4. [로그 기반 CDC와 비교](#cdc)
 5. [binlog 이후에 만난 문제](#after)
-6. [참고](#refs)
+6. [성과와 기대 효과](#outcome)
+7. [참고](#refs)
 
 </div>
 
@@ -166,9 +167,50 @@ CDC로 바꾸면 수집 쪽 문제는 대부분 사라집니다. 대신 문제�
 > 수집 방식을 고르는 일은 "어떤 변경을 하류에 넘길 것인가"를 정하는 일입니다. insert만 넘기면 수집이 어렵고, 모든 변경을 넘기면 반영이 어렵습니다. 둘 중 어느 쪽 비용을 낼지 먼저 정해야 합니다.
 {: .callout .info}
 
+## 6. 성과와 기대 효과 {#outcome}
+
+### 기존 구현의 성과
+
+<div class="table-wrap" markdown="1">
+
+| 구분 | 성과 |
+| --- | --- |
+| 구축 속도 | 별도 애플리케이션 코드 없이 Logstash 설정 파일 하나로 MySQL → Kafka 실시간 경로를 만듦 |
+| 최신성 | 5초 주기 폴링으로, 이벤트 로그가 DB에 쌓인 뒤 수 초 안에 스트림 처리 쪽으로 전달 |
+| 순서 보장 | 이벤트 안의 `table.id`를 Kafka 키로 써서, 같은 `table_id`의 이벤트는 같은 파티션에 순서대로 들어감 |
+| 재시작 안전성 | 마지막으로 읽은 `id`를 파일로 남겨, Logstash를 재시작해도 처음부터 다시 읽지 않고 이어서 읽음 |
+| 원본 보존 | 이벤트 JSON을 가공하지 않고 그대로 보내, 해석은 하류에서 자유롭게 하도록 둠 |
+
+</div>
+
+### 개선을 적용하면 얻는 것
+
+로그 기반 CDC(Debezium)로 바꿨을 때의 예상입니다. 수치는 당시 설정으로 계산했습니다.
+
+<div class="table-wrap" markdown="1">
+
+| 개선 | 지표 | 지금 | 적용 후 (예상) | 근거 |
+| --- | --- | --- | --- | --- |
+| binlog CDC | 감지하는 변경 | insert만 | <span class="pill ok">insert, update, delete</span> 변경 전후 값까지 | 4장 |
+| binlog CDC | 늦게 커밋된 행의 누락 | 쓰기가 몰리면 발생 가능 | <span class="pill ok">0</span> binlog 보존 기간 안이면 | 3장 |
+| binlog CDC | 처리량 상한 | 초당 2,000건 (5초 × 1만 건) | <span class="pill ok">설정에 박힌 상한 없음</span> | 3장 |
+| binlog CDC | 지연 | 폴링 주기 0~5초 + 조회 시간 | <span class="pill ok">폴링 주기 없음</span> 커밋 순서대로 바로 전달 | 4장 |
+| binlog CDC | 운영 DB 부하 | 5초마다 조회 | <span class="pill ok">조회 없음</span> binlog 읽기만 | 4장 |
+| binlog CDC | 스키마 변경 대응 | 쿼리 수정과 재배포 | <span class="pill ok">스키마 변경 이벤트로 전달</span> | 4장 |
+| keystore | 계정 정보 | 설정 파일에 평문 | <span class="pill ok">keystore 참조</span> | 1장 |
+| binlog CDC | 재시작 시 중복 | at-least-once | <span class="pill info">그대로</span> 이벤트의 binlog 위치를 중복 제거 키로 쓸 수 있음 | 4장 |
+| binlog CDC | 하류의 반영 부담 | insert를 append | <span class="pill warn">update·delete를 순서대로 반영해야 함</span> 대가로 생기는 일 | 5장 |
+
+</div>
+
+> **측정 방법**
+>
+> 전환 전에는 원본 테이블의 `id` 구간별 건수와 Kafka 토픽에 들어온 건수를 비교해 실제 누락이 있었는지 확인합니다. 전환 후에는 Debezium의 `MilliSecondsBehindSource` 지표로 지연을, 같은 비교로 누락 0을 확인합니다.
+{: .callout .info}
+
 * * *
 
-## 6. 참고 {#refs}
+## 7. 참고 {#refs}
 
 - [Logstash Jdbc input plugin](https://www.elastic.co/guide/en/logstash/current/plugins-inputs-jdbc.html)
 - [Logstash Kafka output plugin](https://www.elastic.co/guide/en/logstash/current/plugins-outputs-kafka.html)

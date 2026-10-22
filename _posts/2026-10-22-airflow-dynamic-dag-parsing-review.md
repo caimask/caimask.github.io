@@ -34,7 +34,8 @@ MySQL에 등록된 로그 설정 한 row마다 수집(intake) DAG 하나를 만�
 6. [파일 하나 vs 파일 300개](#files)
 7. [다른 선택지](#alternatives)
 8. [적용 순서](#plan)
-9. [참고](#refs)
+9. [성과와 기대 효과](#outcome)
+10. [참고](#refs)
 
 </div>
 
@@ -410,9 +411,54 @@ factory 모듈 + 생성기로 DAG 파일 N개 생성(6장). pre/post hook 컬럼
 > Iceberg 커넥터의 커밋 경합과 같은 교훈입니다. 느려지는 원인은 한 번의 무거운 작업이 아니라 **가벼워 보이는 작업이 몇 겹으로 곱해지는 것**이었습니다. 커넥터에서는 "writer 수 × 몇 초마다 커밋"이, 여기서는 "설정 수 × 파싱 주기 × 태스크 수"가 그랬습니다. 코드를 볼 때는 무엇을 하느냐보다 **언제, 몇 번 실행되느냐**를 먼저 봅니다. ([Iceberg 커밋 경합 리뷰](/2026/10/08/iceberg-commit-conflict-review.html))
 {: .callout .info}
 
+## 9. 성과와 기대 효과 {#outcome}
+
+### 기존 구현의 성과
+
+<div class="table-wrap" markdown="1">
+
+| 구분 | 성과 |
+| --- | --- |
+| 수집 자동화 | 수집 대상 약 300개를 MySQL에 row로 등록하는 것만으로 DAG이 만들어짐. 대상을 추가할 때 코드 변경과 배포가 필요 없음 |
+| 리소스 자동 산정 | 입수된 로그 파일 크기로 Glue worker 수와 Spark 파티션 수를 실행마다 계산 |
+| 비용 절감 | 입수할 데이터가 없으면 Glue 실행을 건너뜀 |
+| 동시성 제어 | pool로 Glue 동시 실행을 20개로 제한해, 대상이 늘어도 Glue 한도를 넘지 않음 |
+| 테이블 관리 | 다음 날짜의 실시간 조회용 파티션 생성, 보관 기간(7일)이 지난 실시간 로그 삭제, 데이터가 없는 날의 빈 파티션 삭제를 자동으로 처리 |
+| 품질 관리 | 적재 후 Trino `ANALYZE`로 통계 갱신, 파일·데이터 크기를 `log_stats`에 기록, 적재 건수가 0이면 이상 이벤트 기록 |
+| 감사·추적 | 성공, 실패, 건너뜀, 종료를 OpenSearch에 태스크 단위로 기록 |
+| 재처리 | 수동 실행 시 날짜(`--DT`)와 Glue 리소스를 덮어써 대상 하나만 다시 처리. 이때는 실시간 파티션 정책을 건드리지 않음 |
+
+</div>
+
+### 개선을 적용하면 얻는 것
+
+아래 수치는 N=300과 코드 구조로 계산한 예상치입니다. 적용 후 측정값으로 바꿉니다.
+
+<div class="table-wrap" markdown="1">
+
+| 개선 | 지표 | 지금 | 적용 후 (예상) | 근거 |
+| --- | --- | --- | --- | --- |
+| ③ 워커 파싱 축소 | 태스크 1개 시작 시 만드는 DAG | 300개 | <span class="pill ok">1개</span> | 5장 |
+| ③ 워커 파싱 축소 | DAG 1회 실행에서 만드는 DAG 객체 | 약 2,100개 | <span class="pill ok">약 7개</span> | 3장 |
+| ① pool 생성 제거 | 파싱 1회당 pool 생성 호출 | 300회 | <span class="pill ok">0회</span> | 5장 |
+| ② SSM 지연 로딩 | 파싱마다 SSM API 호출 | 1회 (스케줄러 30초마다 + 태스크마다) | <span class="pill ok">0회</span> 감사 로그를 보낼 때만 | 5장 |
+| ④ 설정 캐시 | MySQL 장애 시 사라지는 DAG | 300개 전체 | <span class="pill ok">0개</span> 마지막 캐시로 유지 | 4장, 5장 |
+| 파일 분리 | 파싱 병렬도 | 1 프로세스 | <span class="pill ok">`parsing_processes`만큼</span> | 6장 |
+| 파일 분리 | 대상 증가에 따른 `dagbag_import_timeout` 위험 | N에 비례해 커짐 | <span class="pill ok">N과 무관</span> | 6장 |
+| 파일 분리 | 장애 범위 | 300개 전체 | <span class="pill ok">DAG 하나</span> | 6장 |
+| 파일 분리 | 설정 변경 이력 | DB 상태에만 있음 | <span class="pill ok">git 이력</span> | 6장 |
+| 파일 분리 | 설정 반영 속도 | 다음 파싱 때 | <span class="pill warn">생성기 주기만큼 늦음</span> 대가로 내주는 것 | 6장 |
+
+</div>
+
+> **측정 방법**
+>
+> 적용 전후로 `airflow dags report`의 파일별 파싱 시간, 스케줄러의 `dag_processing.last_duration` 지표, 태스크가 queued에서 running으로 바뀌기까지의 시간을 비교합니다. 워커 파싱이 줄면 마지막 값이 가장 크게 달라집니다.
+{: .callout .info}
+
 * * *
 
-## 9. 참고 {#refs}
+## 10. 참고 {#refs}
 
 - [Airflow Best Practices: Top level Python Code](https://airflow.apache.org/docs/apache-airflow/stable/best-practices.html#top-level-python-code)
 - [Airflow: Dynamic DAG Generation](https://airflow.apache.org/docs/apache-airflow/stable/howto/dynamic-dag-generation.html) (`get_parsing_context` 포함)

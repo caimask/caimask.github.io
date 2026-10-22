@@ -32,7 +32,8 @@ author: caimask
 5. [코드 변경 사항 (1단계: 커밋 묶기 + 레지스트리)](#changes)
 6. [코드 변경 사항 (2단계: coordinator)](#coord)
 7. [배치 방식과의 선택 기준](#choose)
-8. [참고](#refs)
+8. [성과와 기대 효과](#outcome)
+9. [참고](#refs)
 
 </div>
 
@@ -331,12 +332,52 @@ private boolean internalPosDelete(StructLike key) {
 > source가 AWS DocumentDB(`mdp-docdb5-prod…docdb.amazonaws.com`)입니다. 토스 글과 이 문서의 분석은 Debezium MongoDB 커넥터의 키와 순서 의미를 전제로 합니다. DocumentDB change stream에서 `source.ord`와 키 형식이 MongoDB와 같은지 실제 데이터로 한 번 확인하세요.
 {: .callout .warn}
 
+## 8. 성과와 기대 효과 {#outcome}
+
+### 기존 구현의 성과
+
+외부 사례와 나란히 놓고 보니, 기존 구현이 이미 갖추고 있던 것이 분명해졌습니다.
+
+<div class="table-wrap" markdown="1">
+
+| 구분 | 성과 |
+| --- | --- |
+| 정합성 | 토스가 운영 중에 겪은 세 가지 중복 문제가 지금 구조에서는 생기지 않음. Kafka 키가 테이블 id와 같고(이슈 1), 커밋이 `put()` 단위라 writer와 맵의 수명이 커밋과 같음(이슈 2, 3) |
+| writer 설계 | writer 핵심부(`BaseEqualityDeltaWriter`)가 토스가 쓴 커넥터와 같은 구조. 같은 커밋 안의 중복은 position delete, 이전 커밋의 행은 equality delete로 지우는 규칙을 이미 따름 |
+| 구조 전환 | buffer + Spark 배치로 바꾸면서 커밋 경합과 equality delete를 함께 없앰. 토스와는 다른 갈래로 같은 문제를 푼 셈 |
+| 분석 | 다음 단계로 제안한 "커밋 묶기"가 이슈 3을 새로 만든다는 점을 **적용 전에** 찾아, 회귀를 막을 수정 지점(레지스트리)을 미리 정함 |
+
+</div>
+
+### 개선을 적용하면 얻는 것
+
+자체 커넥터에 토스 방식을 적용할 때의 예상입니다. 수치는 운영 설정(task 3개, 토픽 1개, 커밋 간격 5분)으로 계산했습니다.
+
+<div class="table-wrap" markdown="1">
+
+| 개선 | 지표 | 지금 | 적용 후 (예상) | 근거 |
+| --- | --- | --- | --- | --- |
+| 1단계: 커밋 묶기 | 테이블당 커밋 | 몇 초마다, 최대 8개 writer | <span class="pill ok">5분에 최대 3회</span> 경합은 사실상 사라짐 | 4장 |
+| 1단계: 레지스트리 | 같은 커밋 안의 중복 행 | 0. 단, 레지스트리 없이 커밋만 묶으면 스키마 변경 때 발생 | <span class="pill ok">커밋을 묶어도 0</span> | 3장, 5장 |
+| 1단계: 레지스트리 | 커밋 안에서 파티션을 옮긴 id | 이전 위치를 지우지 못함 | <span class="pill ok">position delete로 정확히 삭제</span> | 5장 |
+| 1단계: 쓰기·커밋 분리 | 실패 시 고아 파일 | 남음 | <span class="pill ok">abort로 정리</span> | 5장 |
+| 2단계: coordinator | 테이블당 커밋 | 5분에 최대 3회 | <span class="pill ok">1회</span> | 6장 |
+| 2단계: coordinator | 전달 보장 | at-least-once + upsert 멱등성 | <span class="pill ok">exactly-once</span> 스냅샷에 offset 기록 | 6장 |
+| 커밋 간격 | mirror 최신성 | 수 초 (경합이 없을 때) | <span class="pill warn">5분 이내</span> 배치 방식(15~25분)보다는 빠름 | 7장 |
+
+</div>
+
+> **측정 방법**
+>
+> 같은 커밋 안의 중복은 mirror 테이블에서 `GROUP BY id HAVING count(*) > 1`로 바로 확인할 수 있습니다. 1단계를 적용한 뒤 스키마 변경이 있었던 날을 골라 이 쿼리가 0건인지 보면, 레지스트리가 제대로 동작하는지 검증됩니다.
+{: .callout .info}
+
 * * *
 
-## 8. 참고 {#refs}
+## 9. 참고 {#refs}
 
 - [토스증권 Iceberg 적용기 #1: CDC 환경은 왜 제대로 동작하지 않을까? (toss.tech, 2025-09-10)](https://toss.tech/article/iceberg-cdc-1)
 - [Apache Iceberg Spec: Row-level Deletes (sequence number 적용 규칙)](https://iceberg.apache.org/spec/#row-level-deletes)
 - [databricks/iceberg-kafka-connect](https://github.com/databricks/iceberg-kafka-connect) (토스가 사용한 커넥터, 구 tabular-io, 유지보수 중단)
 - [apache/iceberg: kafka-connect](https://github.com/apache/iceberg/tree/main/kafka-connect) · [문서](https://iceberg.apache.org/docs/latest/kafka-connect/)
-- 연관 문서: [Iceberg 커밋 경합 리뷰](/2026/10/08/iceberg-commit-conflict-review.html) · [Buffer Writer 배치 적재 리뷰](/2026/10/21/buffer-writer-batch-review.html)
+- 연관 문서: [Iceberg 커밋 경합 리뷰](/2026/10/08/iceberg-commit-conflict-review.html) · [Buffer Writer 배치 적재 리뷰](/2026/10/15/buffer-writer-batch-review.html)

@@ -38,7 +38,8 @@ AWS로 시스템을 구성하며 쓰던 네트워크 요소를 정리한 2020년
 6. [고민 사항에 대한 답](#answers)
 7. [데이터 레이크 운영에서의 네트워크 비용](#cost)
 8. [새롭게 알게 된 것](#learned)
-9. [참고](#refs)
+9. [성과와 기대 효과](#outcome)
+10. [참고](#refs)
 
 </div>
 
@@ -209,9 +210,48 @@ ZooKeeper의 임시 노드와 leader 선출은 [Apache ZooKeeper](/2020/09/19/po
 - Multi-AZ는 물리적으로 분리된 AZ에 시스템을 나눠 두는 고가용성 구성입니다. ALB만 여러 AZ에 걸쳐 있다고 Multi-AZ가 아니고, 그 뒤의 서버와 저장소, NAT Gateway까지 AZ마다 있어야 합니다.
 - S3 트래픽은 Gateway endpoint로 보내야 NAT 요금이 붙지 않습니다.
 
+## 9. 성과와 기대 효과 {#outcome}
+
+### 기존 구성의 성과
+
+<div class="table-wrap" markdown="1">
+
+| 구분 | 성과 |
+| --- | --- |
+| 네트워크 분리 | public과 private 영역을 route table로 나눠, 서버와 DB를 인터넷에서 직접 접근할 수 없는 private subnet에 둠 |
+| 외부 통신 | private subnet의 서버가 public IP 없이 NAT Gateway로만 외부에 나가도록 구성 |
+| 비용 | S3 Gateway endpoint를 public과 private route table 양쪽에 넣어, S3 트래픽이 NAT를 거치지 않고 NAT 처리 요금도 붙지 않음 |
+| 연결 | VPC Peering으로 다른 VPC와 사설 IP로 통신 |
+| 진입점 | public subnet을 두 AZ에 둬, 인터넷 쪽 진입점은 AZ를 나눠 배치할 수 있는 구조 |
+
+</div>
+
+### 개선을 적용하면 얻는 것
+
+5장의 개선안(AZ마다 public·private subnet 한 쌍, AZ별 NAT Gateway)과 6장의 저장소 이중화를 적용했을 때의 예상입니다.
+
+<div class="table-wrap" markdown="1">
+
+| 개선 | 지표 | 지금 | 적용 후 (예상) | 근거 |
+| --- | --- | --- | --- | --- |
+| AZ별 private subnet | AZ 하나 장애 시 서버 영역 | 전체 중단 | <span class="pill ok">남은 AZ에서 계속 운영</span> | 5장 |
+| AZ별 NAT Gateway | NAT 단일 장애점 | 1개 (그 AZ가 죽으면 외부 통신 단절) | <span class="pill ok">없음</span> AZ마다 자기 NAT 사용 | 4장 |
+| RDS Multi-AZ | DB가 있는 AZ 장애 시 | DB가 단일 AZ에 있어 함께 중단 | <span class="pill ok">standby로 자동 전환</span> 보통 1~2분 | 6장 |
+| 합의 클러스터 3 AZ 배치 | ZooKeeper·KRaft controller의 AZ 장애 내성 | 이전 구성에서 다루지 않음 | <span class="pill ok">AZ 1곳 장애에도 과반수 유지</span> | 4장 |
+| HDFS NameNode HA | NameNode 장애 시 | 단일 NameNode라면 클러스터 중단 | <span class="pill ok">ZKFC가 standby 자동 승격</span> | 6장 |
+| `client.rack` 설정 | Kafka consumer의 AZ 간 전송 | 기본 설정이면 다른 AZ의 leader에서 읽음 | <span class="pill ok">같은 AZ replica에서 읽음</span> | 7장 |
+| AZ별 NAT, 동기 복제 | 비용 | NAT 1개 | <span class="pill warn">NAT 시간당 요금 × AZ 수 + AZ 간 전송 요금</span> 가용성의 대가 | 4장, 6장 |
+
+</div>
+
+> **측정 방법**
+>
+> 가용성은 실제로 장애를 일으켜 확인합니다. 한 AZ의 private subnet 인스턴스를 내려 서비스가 계속되는지 보고, RDS는 "장애 조치로 재부팅"으로 전환 시간을 잽니다. AWS Fault Injection Service로 AZ 단위 장애를 연습할 수도 있습니다. 비용은 Cost Explorer에서 NAT Gateway와 데이터 전송 항목을 적용 전후로 비교합니다.
+{: .callout .info}
+
 * * *
 
-## 9. 참고 {#refs}
+## 10. 참고 {#refs}
 
 ### AWS 문서
 
