@@ -16,11 +16,23 @@ icon: "fa-folder-open"
 
 <div class="step" markdown="1">
 
-<span class="when">Kafka Connect · Debezium · Iceberg · Spark · Kubernetes</span>
+<span class="when">Kafka · Kafka Connect · Debezium · Kubernetes</span>
+
+### [이벤트 기반 데이터 파이프라인 구축](/portfolio/event-driven-pipeline)
+
+원본 DB 변경을 Debezium으로 Kafka에 발행하고, 하나의 CDC 토픽을 데이터 레이크 적재·내부 API 호출·외부 발행·지연 측정이 각자 소비하는 구조를 만들었습니다. 하류 연동은 모두 Kafka Connect 플러그인으로 개발해 EKS 위 클러스터에서 운영했습니다.
+
+**판단**: 하류 연동을 플러그인으로 통일, 분배는 설정으로, 외부 호출 실패는 DLQ로 격리, 설정으로 안 풀리는 문제는 오픈소스(Avro Converter·Debezium) 수정
+
+</div>
+
+<div class="step" markdown="1">
+
+<span class="when">Kafka Connect · Iceberg · Spark</span>
 
 ### [CDC 이벤트를 Iceberg에 적재하는 파이프라인](/portfolio/cdc-iceberg-ingestion)
 
-MongoDB CDC 이벤트를 Iceberg에 적재하는 Kafka Connect sink를 만들어 운영했습니다. 커밋 경쟁으로 느려지자 원인을 짚어 buffer + Spark 배치 구조로 바꿨습니다. 커넥터가 도는 Kafka Connect 클러스터를 EKS에 구성하고, 설정으로 풀리지 않는 문제는 Avro Converter·Debezium 코드를 고쳐 해결했습니다.
+MongoDB CDC 이벤트를 Iceberg에 적재하는 Kafka Connect sink를 만들어 운영했습니다. 커밋 경쟁으로 느려지자 원인을 짚어 buffer + Spark 배치 구조로 바꿨습니다.
 
 **결과**: 테이블당 커밋 주체 8 → 1, 커밋 몇 초마다 → 10분에 2~3회, equality delete 0
 
@@ -46,6 +58,7 @@ Glue job 하나가 스케줄러로 동작하던 입수 파이프라인을 MWAA�
 
 | 문서 | 사례 | 내용 |
 | --- | --- | --- |
+| [Kafka Connect 클러스터 구성과 오픈소스 패치](/2026/10/23/kafka-connect-platform.html) | 이벤트 기반 파이프라인 | EKS·Helm 클러스터 구성, 커넥터 배포 CI, Avro Converter·Debezium 패치의 원인과 대가 |
 | [Iceberg 커밋 경합 리뷰](/2026/10/08/iceberg-commit-conflict-review.html) | CDC → Iceberg | 커넥터가 느렸던 원인, OCC와 lock, 삭제 방식, 테이블 운영 최적화 |
 | [Buffer Writer 배치 적재 리뷰](/2026/10/15/buffer-writer-batch-review.html) | CDC → Iceberg | 전환한 구조의 성과와 자기 검토로 찾은 결함, 개선안 |
 | [토스 Iceberg CDC 사례 비교](/2026/10/20/toss-iceberg-cdc-compare.html) | CDC → Iceberg | 외부 사례와 비교, 커밋을 묶을 때의 정합성 문제 |
