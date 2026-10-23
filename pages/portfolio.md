@@ -16,25 +16,13 @@ icon: "fa-folder-open"
 
 <div class="step" markdown="1">
 
-<span class="when">Kafka Connect · Iceberg · Spark</span>
+<span class="when">Kafka Connect · Debezium · Iceberg · Spark · Kubernetes</span>
 
 ### [CDC 이벤트를 Iceberg에 적재하는 파이프라인](/portfolio/cdc-iceberg-ingestion)
 
-MongoDB CDC 이벤트를 Iceberg에 적재하는 Kafka Connect sink를 만들어 운영했습니다. 커밋 경쟁으로 느려지자 원인을 짚어 buffer + Spark 배치 구조로 바꿨습니다.
+MongoDB CDC 이벤트를 Iceberg에 적재하는 Kafka Connect sink를 만들어 운영했습니다. 커밋 경쟁으로 느려지자 원인을 짚어 buffer + Spark 배치 구조로 바꿨습니다. 커넥터가 도는 Kafka Connect 클러스터를 EKS에 구성하고, 설정으로 풀리지 않는 문제는 Avro Converter·Debezium 코드를 고쳐 해결했습니다.
 
 **결과**: 테이블당 커밋 주체 8 → 1, 커밋 몇 초마다 → 10분에 2~3회, equality delete 0
-
-</div>
-
-<div class="step" markdown="1">
-
-<span class="when">Kafka Connect · Kubernetes · Helm</span>
-
-### [쿠버네티스에서 운영하는 Kafka Connect 클러스터와 재빌드 이미지](/portfolio/kafka-connect-k8s-image)
-
-EKS에 Kafka Connect 클러스터를 Helm chart로 구성하고 공식 이미지를 재빌드해 운영했습니다. 설정으로 풀리지 않는 문제는 오픈소스(Avro Converter, Debezium)를 직접 고쳐 이미지에 넣었습니다.
-
-**결과**: 커넥터 배포와 이미지 빌드 분리, Schema Registry 일시 실패 시 task 중단 → 재시도, `@` 필드 필터링으로 CDC 메시지 축소
 
 </div>
 
@@ -61,6 +49,7 @@ Glue job 하나가 스케줄러로 동작하던 입수 파이프라인을 MWAA�
 | [Iceberg 커밋 경합 리뷰](/2026/10/08/iceberg-commit-conflict-review.html) | CDC → Iceberg | 커넥터가 느렸던 원인, OCC와 lock, 삭제 방식, 테이블 운영 최적화 |
 | [Buffer Writer 배치 적재 리뷰](/2026/10/15/buffer-writer-batch-review.html) | CDC → Iceberg | 전환한 구조의 성과와 자기 검토로 찾은 결함, 개선안 |
 | [토스 Iceberg CDC 사례 비교](/2026/10/20/toss-iceberg-cdc-compare.html) | CDC → Iceberg | 외부 사례와 비교, 커밋을 묶을 때의 정합성 문제 |
+| [Glue 스케줄러를 MWAA로 옮긴 데이터 입수 파이프라인 전환](/2026/10/23/glue-scheduler-to-mwaa.html) | MWAA 입수 파이프라인 | 전환 전 구조, MWAA 환경 구성, 스케줄러 기능을 Airflow로 대응시킨 방식 |
 | [Airflow 동적 DAG 파싱 과부하 리뷰](/2026/10/22/airflow-dynamic-dag-parsing-review.html) | MWAA 입수 파이프라인 | 파싱 비용 분석, 발견한 결함, 개선안과 비용 모델 |
 
 </div>
