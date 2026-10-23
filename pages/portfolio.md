@@ -7,7 +7,7 @@ icon: "fa-folder-open"
 
 데이터 파이프라인을 설계·개발하고 운영해 온 기록입니다. 직접 만든 시스템이 어디서 한계에 부딪혔는지 원인을 짚고, 구조를 바꾸거나 개선 순서를 세운 사례를 한 페이지씩 정리했습니다. 각 사례 끝에서 원인 분석과 코드 수준의 검토를 담은 상세 문서로 이어집니다.
 
-기술: Kafka · Kafka Connect · Debezium · Apache Iceberg · Spark · Airflow · AWS(S3, Glue, Glue Catalog)
+기술: Kafka · Kafka Connect · Debezium · Apache Iceberg · Spark · Airflow · Kubernetes · Helm · AWS(S3, Glue, Glue Catalog, EKS)
 {: .meta}
 
 ## 사례 {#cases}
@@ -23,6 +23,18 @@ icon: "fa-folder-open"
 MongoDB CDC 이벤트를 Iceberg에 적재하는 Kafka Connect sink를 만들어 운영했습니다. 커밋 경쟁으로 느려지자 원인을 짚어 buffer + Spark 배치 구조로 바꿨습니다.
 
 **결과**: 테이블당 커밋 주체 8 → 1, 커밋 몇 초마다 → 10분에 2~3회, equality delete 0
+
+</div>
+
+<div class="step" markdown="1">
+
+<span class="when">Kafka Connect · Kubernetes · Helm</span>
+
+### [쿠버네티스에서 운영하는 Kafka Connect 클러스터와 재빌드 이미지](/portfolio/kafka-connect-k8s-image)
+
+EKS에 Kafka Connect 클러스터를 Helm chart로 구성하고 공식 이미지를 재빌드해 운영했습니다. 설정으로 풀리지 않는 문제는 오픈소스(Avro Converter, Debezium)를 직접 고쳐 이미지에 넣었습니다.
+
+**결과**: 커넥터 배포와 이미지 빌드 분리, Schema Registry 일시 실패 시 task 중단 → 재시도, `@` 필드 필터링으로 CDC 메시지 축소
 
 </div>
 
