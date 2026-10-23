@@ -10,6 +10,9 @@ MongoDB CDC 이벤트를 Kafka에서 Iceberg로 적재하려고 제가 설계·�
 역할: 커넥터 설계·개발(2023-08 ~ 2024-12 archive), 이후 buffer + Spark 배치 구조로 전환
 {: .meta}
 
+이 글을 한 페이지로 요약한 사례: [CDC 이벤트를 Iceberg에 적재하는 파이프라인](/portfolio/cdc-iceberg-ingestion)
+{: .meta}
+
 작성 2026-10-08 · 보강 2026-10-22 · Iceberg 1.4.3 · Glue Catalog
 {: .meta}
 

@@ -10,6 +10,9 @@ MySQL에 등록된 로그 설정 한 row마다 수집(intake) DAG 하나를 만�
 작성 2026-10-22 · 역할 DAG 생성 코드 설계·개발, 이후 자기 검토 · 대상 설정 기반 동적 DAG 생성 코드(intake) · Airflow 2.x · AWS Glue 4.0 · 규모 약 300 DAG
 {: .meta}
 
+이 글을 한 페이지로 요약한 사례: [설정 기반 Airflow 수집 DAG 생성기](/portfolio/airflow-dynamic-dag)
+{: .meta}
+
 <div class="summary" markdown="1">
 
 ## 요약 {#tldr}

@@ -10,6 +10,9 @@ Kafka Connect upsert 커넥터의 커밋 경합을 피하려고 제가 설계·�
 작성 2026-10-15 · 역할: buffer sink 커넥터와 Spark 배치(`batch-writer`) 설계·개발, 커넥터 구조에서의 전환 · Parquet 1.13.1 · PySpark 3.5.0 · Kyuubi
 {: .meta}
 
+이 글을 한 페이지로 요약한 사례: [CDC 이벤트를 Iceberg에 적재하는 파이프라인](/portfolio/cdc-iceberg-ingestion)
+{: .meta}
+
 <div class="summary" markdown="1">
 
 ## 요약 {#tldr}
