@@ -46,14 +46,14 @@ Airflow를 직접 운영하지 않고 MWAA를 택해 스케줄러·워커·메�
 
 <div class="table-wrap" markdown="1">
 
-| 항목 | 전환 전 (Glue 스케줄러) | 전환 후 (MWAA) |
-| --- | --- | --- |
-| 실행 단위 | 스케줄러 job 1회 안에서 전체 처리 | <span class="pill ok">대상마다 DAG</span> |
-| 동시성 제어 | 스레드·큐·메모리 안의 리소스 계산 | <span class="pill ok">그룹·원천 유형별 pool</span> |
-| 실패 처리 | 재시도·알림 없음 | <span class="pill ok">태스크 재시도 + 알림</span> |
-| 재처리 | 스케줄러 job 전체 재실행 | <span class="pill ok">대상 하나만 수동 실행</span> |
-| 실행 이력 | 스케줄러 로그 하나에 섞임 | <span class="pill ok">태스크 단위 감사 로그</span> |
-| 플러그인·의존성 변경 | S3에 올리면 다음 실행부터 | <span class="pill warn">MWAA 환경 갱신에 약 20분</span> 대가로 내준 것 |
+| 항목 | 전환 전 (Glue 스케줄러) | 전환 후 (MWAA) | 평가 |
+| --- | --- | --- | --- |
+| 실행 단위 | 스케줄러 job 1회 안에서 전체 처리 | 대상마다 DAG | <span class="pill ok">개선</span> |
+| 동시성 제어 | 스레드·큐·메모리 안의 리소스 계산 | 그룹·원천 유형별 pool | <span class="pill ok">개선</span> |
+| 실패 처리 | 재시도·알림 없음 | 태스크 재시도 + 알림 | <span class="pill ok">개선</span> |
+| 재처리 | 스케줄러 job 전체 재실행 | 대상 하나만 수동 실행 | <span class="pill ok">개선</span> |
+| 실행 이력 | 스케줄러 로그 하나에 섞임 | 태스크 단위 감사 로그 | <span class="pill ok">개선</span> |
+| 플러그인·의존성 변경 | S3에 올리면 다음 실행부터 | MWAA 환경 갱신에 약 20분 | <span class="pill warn">감수</span> Airflow 운영을 AWS에 맡긴 대가 |
 
 </div>
 
