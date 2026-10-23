@@ -7,7 +7,7 @@ icon: "fa-folder-open"
 
 데이터 파이프라인을 설계·개발하고 운영해 온 기록입니다. 직접 만든 시스템이 어디서 한계에 부딪혔는지 원인을 짚고, 구조를 바꾸거나 개선 순서를 세운 사례를 한 페이지씩 정리했습니다. 각 사례 끝에서 원인 분석과 코드 수준의 검토를 담은 상세 문서로 이어집니다.
 
-기술: Kafka · Kafka Connect · Debezium · Apache Iceberg · Spark · Airflow · Kubernetes · Helm · AWS(S3, Glue, Glue Catalog, EKS)
+기술: Kafka · Kafka Connect · Debezium · Apache Iceberg · Spark · Airflow · Kubernetes · Helm · Terraform · AWS(S3, Glue, Glue Catalog, EKS, MWAA)
 {: .meta}
 
 ## 사례 {#cases}
@@ -40,13 +40,13 @@ EKS에 Kafka Connect 클러스터를 Helm chart로 구성하고 공식 이미지
 
 <div class="step" markdown="1">
 
-<span class="when">Airflow · AWS Glue</span>
+<span class="when">MWAA · AWS Glue · Terraform</span>
 
-### [설정 기반 Airflow 수집 DAG 생성기](/portfolio/airflow-dynamic-dag)
+### [MWAA 도입을 통한 데이터 입수 파이프라인 관리](/portfolio/mwaa-ingestion-pipeline)
 
-수집 대상 약 300개를 설정 row만으로 DAG화하는 생성기를 만들어 운영했습니다. 대상 증가에 따른 파싱 과부하를 분석해 개선 순서를 세웠습니다.
+Glue job 하나가 스케줄러로 동작하던 입수 파이프라인을 MWAA로 옮겼습니다. 환경은 Terraform으로 구성하고, MySQL 설정 row 하나가 DAG 하나가 되게 했습니다. 이후 대상 증가로 생긴 DAG 파싱 과부하를 분석해 개선 순서를 세웠습니다.
 
-**판단**: 장애 격리 → 파싱 경로의 외부 호출 제거 → 파일 분리 순서 (미적용)
+**결과**: 대상마다 DAG(로그 수집만 약 300개), 동시성 큐 → pool, 태스크 단위 재시도·감사 로그·대상 단위 재처리, 스케줄러 Glue job 2개 삭제
 
 </div>
 
@@ -61,7 +61,7 @@ EKS에 Kafka Connect 클러스터를 Helm chart로 구성하고 공식 이미지
 | [Iceberg 커밋 경합 리뷰](/2026/10/08/iceberg-commit-conflict-review.html) | CDC → Iceberg | 커넥터가 느렸던 원인, OCC와 lock, 삭제 방식, 테이블 운영 최적화 |
 | [Buffer Writer 배치 적재 리뷰](/2026/10/15/buffer-writer-batch-review.html) | CDC → Iceberg | 전환한 구조의 성과와 자기 검토로 찾은 결함, 개선안 |
 | [토스 Iceberg CDC 사례 비교](/2026/10/20/toss-iceberg-cdc-compare.html) | CDC → Iceberg | 외부 사례와 비교, 커밋을 묶을 때의 정합성 문제 |
-| [Airflow 동적 DAG 파싱 과부하 리뷰](/2026/10/22/airflow-dynamic-dag-parsing-review.html) | Airflow | 파싱 비용 분석, 발견한 결함, 개선안과 비용 모델 |
+| [Airflow 동적 DAG 파싱 과부하 리뷰](/2026/10/22/airflow-dynamic-dag-parsing-review.html) | MWAA 입수 파이프라인 | 파싱 비용 분석, 발견한 결함, 개선안과 비용 모델 |
 
 </div>
 
