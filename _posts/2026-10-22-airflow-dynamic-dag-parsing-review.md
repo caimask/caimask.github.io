@@ -10,7 +10,7 @@ MySQL에 등록된 로그 설정 한 row마다 수집(intake) DAG 하나를 만�
 작성 2026-10-22 · 역할 DAG 생성 코드 설계·개발, 이후 자기 검토 · 대상 설정 기반 동적 DAG 생성 코드(intake) · Airflow 2.x · AWS Glue 4.0 · 규모 약 300 DAG
 {: .meta}
 
-이 글은 [MWAA 도입을 통한 데이터 입수 파이프라인 관리](/portfolio/mwaa-ingestion-pipeline) 사례의 하위 이슈입니다. 전환 배경과 MWAA 구성은 사례 페이지에, 요약은 그 페이지의 [6장](/portfolio/mwaa-ingestion-pipeline#parsing)에 있습니다.
+이 글은 [MWAA 도입을 통한 데이터 입수 파이프라인 관리](/portfolio/mwaa-ingestion-pipeline) 사례의 하위 이슈입니다. 전환 배경과 MWAA 구성은 [Glue 스케줄러를 MWAA로 옮긴 데이터 입수 파이프라인 전환](/2026/10/23/glue-scheduler-to-mwaa.html)에 정리했습니다.
 {: .meta}
 
 <div class="summary" markdown="1">
