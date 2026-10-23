@@ -2,9 +2,7 @@
 layout: post
 title: GitHub.io 구축하기
 hide_title: false
-feature-img: "assets/img/georgiana-barbu-nnexP_zjPwA-unsplash.png"
-thumbnail: "assets/img/georgiana-barbu-nnexP_zjPwA-unsplash.png"
-color: rgb(80,140,22)
+color: rgb(0,0,0)
 bootstrap: true
 excerpt_separator: <!--more-->
 tags: [github.io, Jekyll]
