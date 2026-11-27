@@ -40,7 +40,7 @@ author: caimask
 
 ## 1. 클러스터 구성 {#cluster}
 
-Kafka Connect를 distributed 모드로 띄우는 Deployment와 Service, PodDisruptionBudget, 설정용 ConfigMap을 Helm chart 하나로 묶었습니다. Confluent의 공개 chart를 바탕으로 init container, log4j ConfigMap, 외부 Secret, PDB를 더했고, 환경마다 values 파일만 달리 둡니다. 용도에 따라 클러스터를 둘(실험적인 자체 커넥터용, 안정화된 공개 커넥터용)로 나눠 운영했습니다.
+Kafka Connect를 distributed 모드로 띄우는 Deployment와 Service, PodDisruptionBudget, 설정용 ConfigMap을 Helm chart 하나로 묶었습니다. Confluent의 공개 chart를 바탕으로 init container, log4j ConfigMap, 외부 Secret, PDB를 더했고, 환경마다 values 파일만 달리 둡니다. 클러스터는 둘로 나눠 운영했습니다. 직접 만든 커넥터의 새 jar를 적용하려면 worker를 재시작해야 했기 때문에, 코드가 자주 바뀌는 신규 개발 커넥터와 코드가 안정된 커넥터를 다른 클러스터에 두어 재시작의 영향이 안정된 커넥터로 번지지 않게 했습니다.
 
 ```
 [이미지]  cp-kafka-connect 7.2.6
@@ -126,12 +126,12 @@ log4j.appender.stdout.layout=net.logstash.log4j.JSONEventLayoutV1
 
 | 커넥터 | `errors.tolerance` | 재시도 후에도 실패하면 |
 | --- | --- | --- |
-| CDC source, 분배, 적재 커넥터 | 기본값(`none`) | task 실패. 레코드를 건너뛰지 않음 |
-| 외부 API 호출 커넥터(트리거) | `all` + DLQ 토픽 | 레코드를 DLQ로 보내고 다음 레코드 처리 |
+| CDC source, 분배, 적재 커넥터 | 기본값(`none`) | task 실패 |
+| 외부 API 호출 커넥터(트리거) | `all` + DLQ 토픽 (2025-01부터) | 레코드를 DLQ로 보내고 다음 레코드 처리 |
 
 </div>
 
-분배·적재 커넥터는 레코드 하나를 건너뛰면 하류 데이터가 틀어지므로 멈추는 쪽을, 트리거는 레코드 하나 때문에 전체 호출이 멈추지 않도록 DLQ로 격리하는 쪽을 골랐습니다.
+`errors.tolerance`는 런타임의 변환·transform 단계에만 적용됩니다. 플러그인 안에서 생기는 실패는 커넥터마다 따로 다뤘습니다. 분배 커넥터는 형태가 다른 레코드를 설정으로 버리고, 트리거는 API 호출 실패를 `ErrantRecordReporter`로 DLQ에 보냅니다. 자세한 내용은 [CDC 이벤트 분배·트리거·지연 측정 커넥터 설계와 회고](/2026/11/26/cdc-event-distribution-connectors.html#distributor-failure)에 있습니다.
 
 > **판단과 대가**
 >
