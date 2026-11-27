@@ -5,6 +5,9 @@ permalink: /portfolio/
 icon: "fa-folder-open"
 ---
 
+<!-- 자리표시자: [대괄호] 안을 실제 정보로 바꿔 주세요. -->
+**[이름] · 데이터 엔지니어 · [N]년차** · CDC·이벤트 스트리밍과 데이터 레이크 입수 파이프라인을 직접 설계·개발하고 운영했습니다. 경력과 연락처는 [About](/about/)에 있습니다.
+
 데이터 파이프라인을 설계·개발하고 운영해 온 기록입니다. 직접 만든 시스템이 어디서 한계에 부딪혔는지 원인을 짚고, 구조를 바꾸거나 개선 순서를 세운 사례를 한 페이지씩 정리했습니다. 각 사례 끝에서 원인 분석과 코드 수준의 검토를 담은 상세 문서로 이어집니다.
 
 기술: Kafka · Kafka Connect · Debezium · Apache Iceberg · Spark · Airflow · Kubernetes · Helm · Terraform · AWS(S3, Glue, Glue Catalog, EKS, MWAA)
@@ -32,7 +35,7 @@ icon: "fa-folder-open"
 
 ### [CDC 이벤트를 Iceberg에 적재하는 파이프라인](/portfolio/cdc-iceberg-ingestion)
 
-MongoDB CDC 이벤트를 Iceberg에 적재하는 Kafka Connect sink를 만들어 운영했습니다. 커밋 경쟁으로 느려지자 원인을 짚어 buffer + Spark 배치 구조로 바꿨습니다.
+원본 DB(DocumentDB, 이후 MongoDB Atlas)의 CDC 이벤트를 Iceberg에 적재하는 Kafka Connect sink를 만들어 운영했습니다. 커밋 경쟁으로 느려지자 원인을 짚어 buffer + Spark 배치 구조로 바꿨습니다.
 
 **결과**: 테이블당 커밋 주체 8 → 1, 커밋 몇 초마다 → 10분에 2~3회, equality delete 0
 
@@ -59,7 +62,7 @@ Glue job 하나가 스케줄러로 동작하던 입수 파이프라인을 MWAA�
 | 문서 | 사례 | 내용 |
 | --- | --- | --- |
 | [CDC 이벤트 분배·트리거·지연 측정 커넥터 설계와 회고](/2026/11/26/cdc-event-distribution-connectors.html) | 이벤트 기반 파이프라인 | 실제 변경만 고르는 분배 기준, 설정 기반 다중 분배와 오류 격리, 트리거의 DLQ, 지연 측정, 회고 E1~E3 |
-| [Kafka Connect 클러스터 구성과 오픈소스 패치](/2026/10/23/kafka-connect-platform.html) | 이벤트 기반 파이프라인 | EKS·Helm 클러스터 구성, 커넥터 배포 CI, Avro Converter·Debezium 패치의 원인과 대가 |
+| [쿠버네티스 위 Kafka Connect 클러스터 구성과 오픈소스 패치](/2026/10/23/kafka-connect-platform.html) | 이벤트 기반 파이프라인 | EKS·Helm 클러스터 구성, 커넥터 배포 CI, Avro Converter·Debezium 패치의 원인과 대가 |
 | [Iceberg 커밋 경합 리뷰](/2026/10/08/iceberg-commit-conflict-review.html) | CDC → Iceberg | 커넥터가 느렸던 원인, OCC와 lock, 삭제 방식, 테이블 운영 최적화 |
 | [Buffer Writer 배치 적재 리뷰](/2026/10/15/buffer-writer-batch-review.html) | CDC → Iceberg | 전환한 구조의 성과와 자기 검토로 찾은 결함, 개선안 |
 | [토스 Iceberg CDC 사례 비교](/2026/10/20/toss-iceberg-cdc-compare.html) | CDC → Iceberg | 외부 사례와 비교, 커밋을 묶을 때의 정합성 문제 |
