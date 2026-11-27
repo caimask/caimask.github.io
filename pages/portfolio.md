@@ -22,7 +22,7 @@ icon: "fa-folder-open"
 
 원본 DB 변경을 Debezium으로 Kafka에 발행하고, 하나의 CDC 토픽을 데이터 레이크 적재·내부 API 호출·외부 발행·지연 측정이 각자 소비하는 구조를 만들었습니다. 하류 연동은 모두 Kafka Connect 플러그인으로 개발해 EKS 위 클러스터에서 운영했습니다.
 
-**판단**: 하류 연동을 플러그인으로 통일, 분배는 설정으로, 외부 호출 실패는 DLQ로 격리, 설정으로 안 풀리는 문제는 오픈소스(Avro Converter·Debezium) 수정
+**판단**: 하류 연동을 플러그인으로 통일, 실제로 바뀐 변경만 설정 기반으로 분배, 외부 호출 실패는 DLQ로 격리, 설정으로 안 풀리는 문제는 오픈소스(Avro Converter·Debezium) 수정
 
 </div>
 
@@ -58,6 +58,7 @@ Glue job 하나가 스케줄러로 동작하던 입수 파이프라인을 MWAA�
 
 | 문서 | 사례 | 내용 |
 | --- | --- | --- |
+| [CDC 이벤트 분배·트리거·지연 측정 커넥터 설계와 회고](/2026/11/26/cdc-event-distribution-connectors.html) | 이벤트 기반 파이프라인 | 실제 변경만 고르는 분배 기준, 설정 기반 다중 분배와 오류 격리, 트리거의 DLQ, 지연 측정, 회고 E1~E3 |
 | [Kafka Connect 클러스터 구성과 오픈소스 패치](/2026/10/23/kafka-connect-platform.html) | 이벤트 기반 파이프라인 | EKS·Helm 클러스터 구성, 커넥터 배포 CI, Avro Converter·Debezium 패치의 원인과 대가 |
 | [Iceberg 커밋 경합 리뷰](/2026/10/08/iceberg-commit-conflict-review.html) | CDC → Iceberg | 커넥터가 느렸던 원인, OCC와 lock, 삭제 방식, 테이블 운영 최적화 |
 | [Buffer Writer 배치 적재 리뷰](/2026/10/15/buffer-writer-batch-review.html) | CDC → Iceberg | 전환한 구조의 성과와 자기 검토로 찾은 결함, 개선안 |
