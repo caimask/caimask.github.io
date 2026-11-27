@@ -6,12 +6,12 @@ tags: [Iceberg, Kafka Connect, CDC, Spark]
 author: caimask
 ---
 
-MongoDB CDC 이벤트를 Kafka에서 Apache Iceberg로 적재하는 Kafka Connect sink를 직접 만들어 운영했습니다. 적재가 느려지자 원인을 Iceberg의 커밋 경쟁으로 짚었고, buffer sink 커넥터와 Spark 배치로 적재 구조를 바꿔 해소했습니다. 이후 바꾼 구조도 다시 검토해 다음 과제를 정리했습니다.
+원본 DB(처음 AWS DocumentDB, 이후 MongoDB Atlas)의 CDC 이벤트를 Kafka에서 Apache Iceberg로 적재하는 Kafka Connect sink를 직접 만들어 운영했습니다. 적재가 느려지자 원인을 Iceberg의 커밋 경쟁으로 짚었고, buffer sink 커넥터와 Spark 배치로 적재 구조를 바꿔 해소했습니다. 적재 시스템은 2024-12에 일몰했고, 2026-10에 전체 구조를 다시 검토해 남은 결함과 개선 방향을 정리했습니다.
 
-역할: 커넥터 설계·개발(2023-08 ~ 2024-12), buffer sink 커넥터 + Spark 배치 설계·개발과 전환, 회고 문서 작성(2026-10)
+역할: Iceberg sink 커넥터 설계·개발(2023-08 ~), buffer sink 커넥터 + Spark 배치 설계·개발과 전환(2024-04 ~ 06), 적재 시스템 일몰(2024-12), 회고 문서 작성(2026-10)
 {: .meta}
 
-기술: Kafka Connect · Debezium(MongoDB) · Apache Iceberg(Glue Catalog) · Spark · S3 · Kyuubi
+기술: Kafka Connect · Debezium(MongoDB 커넥터) · Apache Iceberg(Glue Catalog) · Spark · S3 · Kyuubi
 {: .meta}
 
 <div class="summary" markdown="1">
@@ -42,7 +42,7 @@ MongoDB CDC 이벤트를 Kafka에서 Apache Iceberg로 적재하는 Kafka Connec
 
 이 판단을 바탕으로 **"append 먼저, merge는 나중에"** 구조로 옮겼습니다. 이벤트를 10분 단위 Parquet 파일로 S3에 버퍼링하고, Spark 배치 job 하나가 log 테이블에는 append하고 mirror 테이블에는 `MERGE`로 반영합니다.
 
-옮기기 전에 공개된 외부 사례(토스증권의 Iceberg CDC 적재기)와 비교했습니다. 그 결과, 커넥터를 유지한 채 커밋만 묶으면 스키마 변경 때 같은 커밋 안에서 중복 행이 생긴다는 점을 적용 전에 찾았습니다.
+일몰 후 회고하면서, 2025-09에 공개된 외부 사례(토스증권의 Iceberg CDC 적재기)와 제 구현을 비교했습니다. 그 결과, 커넥터를 유지한 채 커밋만 묶는 개선안을 택했다면 스키마 변경 때 같은 커밋 안에서 중복 행이 생겼으리라는 점을 확인했습니다.
 
 ## 결과 {#result}
 
@@ -53,15 +53,18 @@ MongoDB CDC 이벤트를 Kafka에서 Apache Iceberg로 적재하는 Kafka Connec
 | 테이블당 커밋 주체 | 최대 8개 task | 배치 job 1개 | <span class="pill ok">개선</span> |
 | 커밋 빈도 | 몇 초마다 | 10분에 테이블당 2~3회 | <span class="pill ok">개선</span> |
 | equality delete | 레코드마다 | 0 | <span class="pill ok">개선</span> |
-| 재처리 | upsert 멱등성에 의존 | 결정적 파일명 + 파티션 덮어쓰기 | <span class="pill ok">개선</span> |
+| 재처리 | upsert 멱등성에 의존 | 결정적 파일명 + 파티션 덮어쓰기. 단, mirror `MERGE`는 버전을 비교하지 않아 늦게 온 과거 변경이 최신 상태를 덮을 수 있음 | <span class="pill ok">개선</span> |
 | 원본 보존 | 없음 | S3 버퍼에 Parquet로 보관 | <span class="pill ok">개선</span> |
 | 최신성 | 수 초 (경합이 없을 때) | 15~25분 | <span class="pill warn">감수</span> 커밋 경합을 없앤 대가 |
+| 데이터 완전성 | offset 커밋으로 보장 | 배치가 벽시계로 윈도우 완료를 판단해, 늦게 도착한 버퍼 파일이 누락될 수 있음 | <span class="pill bad">후퇴</span> 회고에서 찾음, 미해결 |
 
 </div>
 
+최신성은 처음에 이벤트 기반 실시간 반영을 목표로 했습니다. 하지만 모든 변경을 실시간으로 mirror 스냅샷에 반영하기는 어렵다고 판단해, 목표를 내부적으로 15~25분 수준으로 다시 정했습니다. 표의 수치는 운영 설정과 코드에서 계산한 값입니다. 시스템을 일몰해 전환 전후의 실측 기록은 지금 확인할 수 없습니다.
+
 ## 다음 과제 {#next}
 
-바꾼 구조를 다시 검토해 찾은 항목입니다. 수정안을 정리했고, 아직 적용하지 않았습니다.
+일몰 후 2026-10에 전체 구조를 다시 검토해 찾은 항목입니다. 시스템이 운영되지 않으므로 적용하지 않았고, 같은 구조를 다시 만든다면 먼저 고칠 항목으로 정리했습니다.
 
 - **넘겨받는 지점의 누락 위험**: 배치가 벽시계 시간으로 윈도우 완료를 판단해, 늦게 도착한 버퍼 파일이 처리되지 않을 수 있습니다. → 윈도우 단위가 아니라 파일 단위로 증분 처리합니다.
 - **정합성**: mirror `MERGE`의 원본 선택 쿼리와 변경 순서 값의 인코딩에서 변경이 빠지거나 순서가 뒤바뀔 수 있습니다. → 키별 최신 1건을 고르고 버전을 비교하며, 순서 값을 다시 인코딩합니다.
@@ -70,6 +73,10 @@ MongoDB CDC 이벤트를 Kafka에서 Apache Iceberg로 적재하는 Kafka Connec
 > **배운 점**
 >
 > 느려지는 원인은 한 번의 무거운 작업이 아니라, 가벼워 보이는 커밋이 "writer 수 × 몇 초마다"로 곱해지는 데 있었습니다. 코드를 볼 때는 무엇을 하느냐보다 **언제, 몇 번 실행되느냐**를 먼저 봅니다.
+>
+> 구조를 바꿀 때(2024-04) 공식 계열 sink를 조사하지 않고 자체 설계로 개선했습니다. 당시 Tabular 커넥터는 이미 테이블당 coordinator 하나가 커밋하는 구조였습니다. 지금 다시 한다면 공개 구현을 먼저 조사해 자체 개발 범위를 줄이겠습니다.
+>
+> 적재 시스템은 분석 요구 사항이 준비되지 않은 상태에서 먼저 만든 것이었고, 2024-12에 "아직 필요하지 않다"고 판단해 일몰했습니다. 데이터 레이크는 쓸 사람과 질문이 정해진 뒤에 적재 범위를 정하는 편이 맞았습니다.
 {: .callout .info}
 
 ## 상세 문서 {#docs}

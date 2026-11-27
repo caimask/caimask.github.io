@@ -6,7 +6,7 @@ tags: [Kafka, Kafka Connect, Debezium, CDC, Kubernetes]
 author: caimask
 ---
 
-원본 MongoDB의 변경을 Debezium으로 Kafka에 이벤트로 발행하고, 그 이벤트 하나를 여러 하류가 각자의 목적으로 소비하는 파이프라인을 구축해 운영했습니다. 하류 연동은 모두 Kafka Connect 플러그인으로 만들어 같은 클러스터에서 돌렸습니다. 데이터 레이크 적재, 내부 API 호출, 외부 공개용 토픽 발행, 수집 지연 측정이 모두 같은 CDC 토픽에서 출발합니다.
+원본 DB(처음 AWS DocumentDB, 이후 MongoDB Atlas)의 변경을 Debezium으로 Kafka에 이벤트로 발행하고, 그 이벤트 하나를 여러 하류가 각자의 목적으로 소비하는 파이프라인을 구축해 운영했습니다. 하류 연동은 모두 Kafka Connect 플러그인으로 만들어 같은 클러스터에서 돌렸습니다. 데이터 레이크 적재, 내부 API 호출, 외부 공개용 토픽 발행, 수집 지연 측정이 모두 같은 CDC 토픽에서 출발합니다. 이벤트를 만들어 토픽으로 전달하는 부분과 지연 측정 커넥터는 지금도 운영 중이고, 제가 만든 분배·트리거 커넥터는 2025-09에 운영을 종료했습니다.
 
 역할: Kafka Connect 클러스터(EKS·Helm)와 이미지 구성, CDC source 커넥터 구성과 오픈소스 패치, 커넥터 배포 CI, 이벤트 분배·트리거·적재·지연 측정 커넥터 설계·개발(2023-08 ~ 2025-09). 외부 공개용 발행 커넥터는 팀원이 개발했습니다.
 {: .meta}
@@ -75,7 +75,7 @@ MongoDB ──(Debezium source)──▶ CDC 토픽
 
 </div>
 
-커넥터별 동작과 설정은 [CDC 이벤트 분배·트리거·지연 측정 커넥터 설계와 회고](/2026/11/26/cdc-event-distribution-connectors.html)에, Debezium 패치는 [Kafka Connect 클러스터 구성과 오픈소스 패치](/2026/10/23/kafka-connect-platform.html#debezium-filter)에 정리했습니다.
+커넥터별 동작과 설정은 [CDC 이벤트 분배·트리거·지연 측정 커넥터 설계와 회고](/2026/11/26/cdc-event-distribution-connectors.html)에, Debezium 패치는 [쿠버네티스 위 Kafka Connect 클러스터 구성과 오픈소스 패치](/2026/10/23/kafka-connect-platform.html#debezium-filter)에 정리했습니다.
 
 ## 운영 기반 {#platform}
 
@@ -87,10 +87,11 @@ Kafka Connect 클러스터와 그 위의 수정은 상세 문서로 따로 정�
 
 ## 회고 {#retro}
 
-이 글들을 쓰며 코드를 다시 읽고 찾은 결함입니다. 두 커넥터 모두 운영을 종료(2025-09)해 적용하지 않았습니다.
+이 글들을 쓰며 코드를 다시 읽고 찾은 결함입니다. 세 항목 모두 적용하지 않았습니다. E1·E2의 커넥터는 2025-09에 운영을 종료했습니다.
 
 - <span class="pill bad">높음</span> **E1 분배 커넥터**: `send()`를 비동기로 호출하고 `flush()`를 비워 두어, 브로커가 확인하지 않은 메시지의 offset도 커밋될 수 있습니다. 실패 콜백의 예외는 producer I/O 스레드에서 끝나 task에 전달되지 않습니다. → `flush()`에서 발행 완료를 기다리고 실패를 예외로 올립니다.
 - <span class="pill warn">중간</span> **E2 트리거**: DLQ로 보내는 경로가 gRPC 실패에만 있어, 키 변환에 실패하면 task가 멈춥니다. → 레코드 처리 전체를 DLQ 경로로 감쌉니다.
+- <span class="pill info">낮음</span> **E3 지연 측정**: 다음 이벤트가 와야 10분 구간을 닫아, 이벤트가 뜸하면 지표가 비고 경보를 걸기 어렵습니다. → 구간을 벽시계로 닫고 지표로 기록합니다.
 
 > **배운 점**
 >
@@ -104,7 +105,7 @@ Kafka Connect 클러스터와 그 위의 수정은 상세 문서로 따로 정�
 | 문서 | 내용 |
 | --- | --- |
 | [CDC 이벤트 분배·트리거·지연 측정 커넥터 설계와 회고](/2026/11/26/cdc-event-distribution-connectors.html) | 분배 커넥터의 이벤트 모델·필터·설정 구조, 트리거의 호출과 DLQ, 지연 측정 방식, 회고 E1~E3 |
-| [Kafka Connect 클러스터 구성과 오픈소스 패치](/2026/10/23/kafka-connect-platform.html) | EKS·Helm 클러스터 구성, 커넥터 배포 CI, Avro Converter·Debezium 패치의 원인과 대가 |
+| [쿠버네티스 위 Kafka Connect 클러스터 구성과 오픈소스 패치](/2026/10/23/kafka-connect-platform.html) | EKS·Helm 클러스터 구성, 커넥터 배포 CI, Avro Converter·Debezium 패치의 원인과 대가 |
 | [CDC 이벤트를 Iceberg에 적재하는 파이프라인](/portfolio/cdc-iceberg-ingestion) | 같은 CDC 토픽을 데이터 레이크에 적재한 사례. 커밋 경합과 구조 전환 |
 
 </div>

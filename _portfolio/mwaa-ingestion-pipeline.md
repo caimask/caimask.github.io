@@ -6,9 +6,9 @@ tags: [Airflow, MWAA, AWS Glue, Terraform, Data Pipeline]
 author: caimask
 ---
 
-여러 원천(MySQL, Elasticsearch, S3 파일, DynamoDB)의 데이터와 서비스 로그를 S3 데이터 레이크에 입수하는 파이프라인을 직접 만들어 운영했습니다. Glue job 하나가 스케줄러로 동작하던 구조를 AWS MWAA로 옮겨, 설정 row 하나가 Airflow DAG 하나가 되게 했습니다. 이후 대상이 늘면서 생긴 DAG 파싱 과부하도 분석해 개선 순서를 정했습니다.
+여러 원천(MySQL, Elasticsearch, S3 파일, DynamoDB)의 데이터와 서비스 로그를 S3 데이터 레이크에 입수하는 파이프라인을 직접 만들어 운영했습니다. Glue job 하나가 스케줄러로 동작하던 구조를 AWS MWAA로 옮겨, 설정 row 하나가 Airflow DAG 하나가 되게 했습니다. 이후 대상이 늘면서 생긴 DAG 파싱 과부하도 분석해 개선 순서를 정했습니다. 2024-09까지 직접 운영했고, 이후 같은 구성 그대로 다른 담당자에게 넘겼습니다. 이관된 구성은 2026-06에 입수 파이프라인을 Databricks로 옮기면서 정리됐습니다. 파싱 개선안은 그 뒤 회고(2026-10)로 정리한 것이라 적용하지 않았습니다.
 
-역할: 입수 라이브러리와 Glue 스케줄러 설계·개발, MWAA 환경 구성(Terraform)과 DAG 전환(2022-10), Glue 4.0 전환(2024-08 ~ 09), DAG 파싱 자기 검토(2026-10)
+역할: 입수 라이브러리와 Glue 스케줄러 설계·개발, MWAA 환경 구성(Terraform)과 DAG 전환(2022-10), Glue 4.0 전환(2024-08 ~ 09), 직접 운영(2022-10 ~ 2024-09), DAG 파싱 자기 검토(2026-10)
 {: .meta}
 
 기술: AWS MWAA(Airflow 2.2.2) · AWS Glue · Terraform · Spark · MySQL · Trino · OpenSearch
