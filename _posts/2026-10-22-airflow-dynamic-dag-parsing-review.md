@@ -5,9 +5,9 @@ tags: [Airflow, AWS Glue, Data Pipeline]
 author: caimask
 ---
 
-MySQL에 등록된 로그 설정 한 row마다 수집(intake) DAG 하나를 만들도록 제가 설계·개발한 코드를 직접 다시 검토한 문서입니다. 설정이 늘어날수록 DAG을 만드는 과정 자체가 무거워져, 스케줄 주기 안에 처리를 끝내지 못할 수 있는 문제가 있었습니다. 원인이 어디서 몇 번 반복되는지 짚고, 개선안과 적용 순서를 정리했습니다. 개선안은 아직 적용하지 않았습니다. "DAG 하나짜리 파일 300개로 나누면 가벼워진다"는 당시 가정도 함께 검토했습니다.
+MySQL에 등록된 로그 설정 한 row마다 수집(intake) DAG 하나를 만들도록 제가 설계·개발한 코드를 직접 다시 검토한 문서입니다. 설정이 늘어날수록 DAG을 만드는 과정 자체가 무거워져, 스케줄 주기 안에 처리를 끝내지 못할 수 있는 문제가 있었습니다. 원인이 어디서 몇 번 반복되는지 짚고, 개선안과 적용 순서를 정리했습니다. 파이프라인은 2024-09까지 직접 운영한 뒤 같은 구성 그대로 다른 담당자에게 넘겼고, 2026-06에 입수 파이프라인을 Databricks로 옮기면서 정리됐습니다. 이 검토는 그 뒤에 쓴 회고라 개선안은 적용하지 않았습니다. "DAG 하나짜리 파일 300개로 나누면 가벼워진다"는 당시 가정도 함께 검토했습니다.
 
-작성 2026-10-22 · 역할 DAG 생성 코드 설계·개발, 이후 자기 검토 · 대상 설정 기반 동적 DAG 생성 코드(intake) · Airflow 2.x · AWS Glue 4.0 · 규모 약 300 DAG
+작성 2026-10-22 · 역할 DAG 생성 코드 설계·개발, 이후 자기 검토 · 대상 설정 기반 동적 DAG 생성 코드(intake) · Airflow 2.2.2 (MWAA) · AWS Glue 4.0 · 규모 약 300 DAG
 {: .meta}
 
 이 글은 [MWAA 도입을 통한 데이터 입수 파이프라인 관리](/portfolio/mwaa-ingestion-pipeline) 사례의 하위 이슈입니다. 전환 배경과 MWAA 구성은 [Glue 스케줄러를 MWAA로 옮긴 데이터 입수 파이프라인 전환](/2026/10/23/glue-scheduler-to-mwaa.html)에 정리했습니다.
@@ -77,7 +77,7 @@ DAG 파일은 정의 파일이 아니라 **실행되는 파이썬 코드**입니
 
 | 시점 | 누가 | 빈도 |
 | --- | --- | --- |
-| 주기적 파싱 | 스케줄러의 DAG processor | 파일마다 `min_file_process_interval`(기본 30초)마다 |
+| 주기적 파싱 | 스케줄러의 DAG processor | 파일마다 `min_file_process_interval`마다 (기본 30초, 이 환경은 300초로 설정) |
 | 태스크 실행 | 워커 | **태스크 인스턴스 하나가 시작될 때마다** 그 DAG 파일 전체를 다시 실행 |
 | 수동 명령 | `airflow dags list`, `airflow tasks test` 등 | 실행할 때마다 |
 
@@ -105,7 +105,7 @@ items = load_source_config()                           # MySQL 조회
 def create_dag(dag_id, default_args, cfg):
     ...
     pool = ensure_pool(cfg["group"], slots=MAX_GLUE_RUNS)       # 메타 DB에서 조회, 없으면 생성. 파싱마다 N회
-    dag = DAG(dag_id, schedule=get_schedule(), ...)             # 현지 시간 → UTC 계산만. 파싱마다 N회
+    dag = DAG(dag_id, schedule_interval=get_schedule(), ...)           # 현지 시간 → UTC 계산만. 파싱마다 N회
     with dag:
         pre = TriggerAndWait(task_id="task_pre", ...)           # Operator 생성자도 파싱마다 N회
         ...
@@ -128,13 +128,13 @@ Airflow는 UTC 기준으로 동작하므로 `get_schedule()`은 현지 시간 �
 이 비용이 얼마나 반복되는지 따져 보면 이렇습니다.
 
 ```
-스케줄러:  30초마다 × (SSM 1 + MySQL 1 + pool 조회·생성 N + DAG 생성 N)
+스케줄러:  300초마다 × (SSM 1 + MySQL 1 + pool 조회·생성 N + DAG 생성 N)
 워커:      DAG 1회 실행에서 실제로 도는 태스크 7개 안팎 × 같은 비용
            → N=300이면 DAG 한 번 돌 때 DAG 객체 약 2,100개를 만들고 ensure_pool을 약 2,100번 호출
            → DAG 300개가 하루 한 번씩 돈다고 하면 워커 쪽에서만 하루 약 63만 번
 ```
 
-설정이 늘어날수록 부하가 선형으로 커지는 직접적인 원인은 `create_dag()` 안의 외부 호출, 그중에서도 DAG마다 메타 DB를 조회·쓰기 하는 `ensure_pool`입니다. 개선 전후는 다음 명령으로 비교할 계획입니다.
+설정이 늘어날수록 부하가 선형으로 커지는 직접적인 원인은 `create_dag()` 안의 외부 호출, 그중에서도 DAG마다 메타 DB를 조회·쓰기 하는 `ensure_pool`입니다. 개선 전후는 다음 명령으로 비교할 수 있습니다.
 
 ```bash
 airflow dags report                                              # 파일별 파싱 시간
@@ -145,7 +145,7 @@ python -m cProfile -s cumtime dags/ingest_dag.py 2>&1 | head -40
 
 ## 4. 부하와 별개로 발견한 문제 {#bugs}
 
-코드를 다시 보면서 부하와 별개로 찾은 결함입니다. 각 결함의 원인과 개선 방향을 정리했고, 아직 적용하지 않았습니다.
+코드를 다시 보면서 부하와 별개로 찾은 결함입니다. 각 결함의 원인과 개선 방향을 정리했고, 적용하지 않았습니다.
 
 <div class="table-wrap" markdown="1">
 
@@ -164,7 +164,7 @@ python -m cProfile -s cumtime dags/ingest_dag.py 2>&1 | head -40
 
 ## 5. 개선안 {#fix}
 
-제가 정리한 개선 계획입니다. 상태는 모두 미적용이고, 효과가 큰 순서로 적었습니다.
+제가 정리한 개선안입니다. 모두 적용하지 않았고, 효과가 큰 순서로 적었습니다.
 
 ### ① `create_dag()`에서 외부 호출 제거
 
@@ -172,14 +172,15 @@ pool은 DAG을 만들 때마다 메타 DB에서 조회하고 생성할 필요가
 
 ```python
 # 모듈 레벨에서 1회만
-POOL_NAME = "intake_group_pool"   # 이름만 사용. 생성은 배포 단계에서 한 번
+def pool_name(group):               # 그룹별 pool 이름만 계산. 생성은 배포 단계에서 한 번
+    return f"intake_{group}_pool"
 SCHEDULE = get_schedule()         # 현지 시간 → UTC 계산. N회 → 1회
 
 def create_dag(dag_id, default_args, cfg):
     ...
     # pool = ensure_pool(cfg["group"], ...)   ← 삭제
-    dag = DAG(dag_id, schedule=SCHEDULE, ...)
-    submit_glue_job = AwsGlueJobOperator(..., pool=POOL_NAME, ...)
+    dag = DAG(dag_id, schedule_interval=SCHEDULE, ...)
+    submit_glue_job = AwsGlueJobOperator(..., pool=pool_name(cfg["group"]), ...)  # 그룹별 동시 실행 제한은 그대로
 ```
 
 ### ② SSM 호출은 실제로 쓰는 시점까지 미루기
@@ -221,6 +222,8 @@ for item in items:
     globals()[dag_id] = create_dag(dag_id, default_args_for(item), item)
 ```
 
+> 이 환경은 Airflow 2.2.2라 `get_parsing_context()`가 없어 `sys.argv` 분기를 탑니다. 다만 워커가 태스크를 새 프로세스가 아닌 fork로 실행하면 `sys.argv`가 워커 프로세스의 값 그대로일 수 있어, 이 분기가 실제로 DAG ID를 얻는지 확인해야 합니다. 확인되지 않으면 2.4 이상으로 업그레이드하는 것이 전제 조건입니다.
+
 ### ④ 설정은 캐시에서 읽고, 장애 시 마지막 캐시로 버티기
 
 ```python
@@ -237,9 +240,10 @@ def load_source_config():
         return json.loads(CACHE.read_text()) if CACHE.exists() else []
 ```
 
-- 4장의 "DB 장애 시 전체 소실" 문제도 이 수정으로 함께 해결할 계획입니다.
+- MWAA에서는 DAG 폴더가 S3에서 각 노드의 로컬 디스크로 동기화됩니다. 여기에 쓴 캐시는 스케줄러와 워커가 따로 가지며, 노드가 바뀌면 사라집니다. 노드끼리 같은 캐시를 봐야 하면 S3에 두는 방식을 검토해야 합니다.
+- 4장의 "DB 장애 시 전체 소실" 문제도 이 수정으로 함께 해결됩니다.
 - 캐시에서 읽으면 `created_at`이 문자열이므로, `start_date` 계산 전에 `pendulum.parse()`로 변환합니다.
-- 더 나아가면 파싱 경로에서 MySQL을 아예 빼고, 별도의 동기화 DAG가 10분마다 설정을 JSON으로 내보내게 합니다. 이때 스케줄러와 워커가 분리된 환경(Celery, Kubernetes)이라면 JSON을 **모든 노드가 같이 보는 DAG 폴더**(공유 볼륨, git-sync)에 써야 합니다. 파일은 임시 파일에 쓰고 `os.replace`로 바꿔, 반쯤 쓰인 파일을 읽는 일이 없게 합니다.
+- 더 나아가면 파싱 경로에서 MySQL을 아예 빼고, 별도의 동기화 DAG가 10분마다 설정을 JSON으로 내보내게 합니다. 이때 스케줄러와 워커가 분리된 환경(Celery, Kubernetes)이라면 JSON을 **모든 노드가 같이 보는 위치**에 써야 합니다. MWAA라면 DAG 폴더의 원본인 S3 버킷입니다. 파일은 임시 파일에 쓰고 `os.replace`로 바꿔, 반쯤 쓰인 파일을 읽는 일이 없게 합니다.
 
 ### ⑤ 설정 조회 쿼리 개선
 
@@ -263,13 +267,13 @@ CREATE INDEX idx_source_registry_latest ON source_registry (domain, source, data
 
 ### 당장 장애를 막는 임시 조치
 
-구조를 고치기 전에 DAG이 사라지는 것부터 막아야 한다면 설정을 조정합니다. 설정 변경이 늦게 반영되는 것을 감수하는 조치로, 이것도 아직 적용하지 않았습니다.
+구조를 고치기 전에 DAG이 사라지는 것부터 막아야 한다면 설정을 조정합니다. 설정 변경이 늦게 반영되는 것을 감수하는 조치입니다. `min_file_process_interval`은 이미 300초로 쓰고 있었고, 나머지 값은 적용하지 않았습니다.
 
 ```ini
 [core]
 dagbag_import_timeout = 120        # import 실패로 DAG이 사라지는 것 방지
 [scheduler]                        # Airflow 3에서는 [dag_processor]
-min_file_process_interval = 300
+min_file_process_interval = 300   # 이미 적용된 값
 dag_file_processor_timeout = 180
 parsing_processes = 4
 ```
@@ -289,7 +293,7 @@ parsing_processes = 4
 
 <div class="table-wrap" markdown="1">
 
-|   | 파일 1개 → DAG 300개 (현재) | 파일 300개 → 각각 DAG 1개 |
+|   | 파일 1개 → DAG 300개 (당시) | 파일 300개 → 각각 DAG 1개 |
 | --- | --- | --- |
 | 파일 1개 파싱 시간 | `T_fixed + 300·t_dag` | `T_fixed + t_dag` |
 | 전체 CPU 사용량 | `T_fixed + 300·t_dag` | `300·(T_fixed + t_dag)` |
@@ -325,14 +329,15 @@ dag = create_intake_dag({
 ```
 
 ```python
-# plugins/intakes/factory.py  ← 지금의 create_dag. 최상단에 외부 호출 금지
-POOL_NAME = "intake_group_pool"          # 이름만 사용, 생성은 따로
+# plugins/intakes/factory.py  ← 기존 create_dag. 최상단에 외부 호출 금지
+def pool_name(group):                    # 그룹별 pool 이름만 계산, 생성은 따로
+    return f"intake_{group}_pool"
 
 def create_intake_dag(cfg: dict) -> DAG:
     ...  # SSM, Trino, MySQL은 do_pre/do_success 같은 런타임 함수 안에서만 호출
 ```
 
-생성기는 동기화 DAG이나 CI에서 MySQL을 조회해, **바뀐 row의 파일만** 다시 쓰고 지워진 row의 파일은 지우도록 만들 계획입니다.
+생성기는 동기화 DAG이나 CI에서 MySQL을 조회해, **바뀐 row의 파일만** 다시 쓰고 지워진 row의 파일은 지우는 방식입니다.
 
 <div class="table-wrap" markdown="1">
 
@@ -348,7 +353,7 @@ def create_intake_dag(cfg: dict) -> DAG:
 
 > **결론**
 >
-> 지금 300개이고 앞으로 늘어날 예정이므로 파일 생성 방식이 맞다고 판단했습니다. 다만 순서는 **factory에서 최상단 외부 호출 제거 → 파일 분리**여야 합니다. 순서를 바꾸면 고정 비용이 300배가 됩니다.
+> 당시 300개였고 계속 늘어나는 중이었으므로 파일 생성 방식이 맞다고 판단했습니다. 다만 순서는 **factory에서 최상단 외부 호출 제거 → 파일 분리**여야 합니다. 순서를 바꾸면 고정 비용이 300배가 됩니다.
 {: .callout .info}
 
 ## 7. 다른 선택지 {#alternatives}
@@ -372,17 +377,17 @@ def all_intakes():
     def get_configs():
         return MySqlHook("mysql_conn").get_records("SELECT ... FROM source_registry ...")  # 런타임에만 조회
 
-    @task(pool="intake_group_pool")
+    @task  # pool은 태스크 단위로 고정되므로, 그룹별 제한이 필요하면 그룹마다 매핑 태스크를 나눔
     def run_intake(cfg): ...
 
     run_intake.expand(cfg=get_configs())
 ```
 
-Dynamic Task Mapping은 파싱 비용이 설정 수와 무관해집니다. 대신 수집 대상별로 실행 이력을 보거나 하나만 다시 돌리기가 불편해지고, 매핑 개수 상한(`max_map_length`, 기본 1024)이 있습니다. 이 intake는 대상마다 선행·후행 DAG을 따로 둘 수 있고, 수동 실행으로 특정 날짜(`--DT`)와 Glue 리소스를 덮어써 대상 하나만 재처리하는 기능이 있습니다. 그래서 DAG을 대상별로 나눈 설계는 유지하고, DAG을 만드는 방식을 고치는 것이 맞다고 판단했습니다.
+Dynamic Task Mapping은 Airflow 2.3부터 쓸 수 있어 당시 버전(2.2.2)에서는 업그레이드가 먼저 필요합니다(위 코드의 `schedule=` 인자도 2.4부터). 이 방식은 파싱 비용이 설정 수와 무관해집니다. 대신 수집 대상별로 실행 이력을 보거나 하나만 다시 돌리기가 불편해지고, 매핑 개수 상한(`max_map_length`, 기본 1024)이 있습니다. 이 intake는 대상마다 선행·후행 DAG을 따로 둘 수 있고, 수동 실행으로 특정 날짜(`--DT`)와 Glue 리소스를 덮어써 대상 하나만 재처리하는 기능이 있습니다. 그래서 DAG을 대상별로 나눈 설계는 유지하고, DAG을 만드는 방식을 고치는 것이 맞다고 판단했습니다.
 
 ## 8. 적용 순서 {#plan}
 
-아직 적용하지 않은 개선안을 어떤 순서로 적용할지 정한 계획입니다.
+개선안을 적용한다면 어떤 순서가 맞는지 정리한 것입니다.
 
 <div class="steps" markdown="1">
 
@@ -442,16 +447,16 @@ factory 모듈 + 생성기로 DAG 파일 N개 생성(6장).
 
 ### 개선을 적용하면 얻는 것
 
-개선안은 아직 적용하지 않았으므로, 아래 수치는 N=300과 코드 구조로 계산한 예상치입니다. 적용하면 측정값으로 바꿀 계획입니다.
+개선안은 적용하지 않았고 구성도 정리됐으므로, 아래 수치는 N=300과 코드 구조로 계산한 예상치이며 측정값은 없습니다.
 
 <div class="table-wrap" markdown="1">
 
-| 개선 작업 | 무엇이 바뀌나 | 지금 | 적용 후 (예상) | 근거 |
+| 개선 작업 | 무엇이 바뀌나 | 당시 | 적용 후 (예상) | 근거 |
 | --- | --- | --- | --- | --- |
 | **워커에서는 실행할 DAG 하나만 만들기** (③) | 태스크 1개 시작 시 만드는 DAG | 300개 | 1개 | 5장 |
 | | DAG 1회 실행에서 만드는 DAG 객체 | 약 2,100개 | 약 7개 | 3장 |
 | **`create_dag()`에서 pool 조회·생성 호출 없애기** (①) | 파싱 1회당 `ensure_pool` 호출(메타 DB 조회, 없으면 생성) | 300회 | 0회 | 5장 |
-| **SSM 호출을 실제로 쓰는 시점까지 미루기** (②) | 파싱마다 SSM API 호출 | 1회 (스케줄러 30초마다 + 태스크마다) | 0회. 감사 로그를 보낼 때만 호출 | 5장 |
+| **SSM 호출을 실제로 쓰는 시점까지 미루기** (②) | 파싱마다 SSM API 호출 | 1회 (스케줄러 300초마다 + 태스크마다) | 0회. 감사 로그를 보낼 때만 호출 | 5장 |
 | **설정을 캐시에서 읽고, 장애 시 마지막 캐시로 버티기** (④) | MySQL 장애 시 사라지는 DAG | 300개 전체 | 0개 | 4장, 5장 |
 | **대상마다 얇은 DAG 파일로 나누고 공통 factory 사용** | 파싱 병렬도 | 1 프로세스 | `parsing_processes`만큼 | 6장 |
 | | 대상 증가에 따른 `dagbag_import_timeout` 위험 | 대상 수 N에 비례해 커짐 | N과 무관 | 6장 |
@@ -467,7 +472,7 @@ factory 모듈 + 생성기로 DAG 파일 N개 생성(6장).
 
 > **측정 방법**
 >
-> 적용 전후로 `airflow dags report`의 파일별 파싱 시간, 스케줄러의 `dag_processing.last_duration` 지표, 태스크가 queued에서 running으로 바뀌기까지의 시간을 비교할 계획입니다. 워커 파싱이 줄면 마지막 값이 가장 크게 달라집니다.
+> 적용 전후로 `airflow dags report`의 파일별 파싱 시간, 스케줄러의 `dag_processing.last_duration` 지표, 태스크가 queued에서 running으로 바뀌기까지의 시간을 비교하면 됩니다. 워커 파싱이 줄면 마지막 값이 가장 크게 달라집니다.
 {: .callout .info}
 
 * * *

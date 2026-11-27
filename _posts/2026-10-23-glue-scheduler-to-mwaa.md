@@ -5,9 +5,9 @@ tags: [Airflow, MWAA, AWS Glue, Terraform, Data Pipeline]
 author: caimask
 ---
 
-여러 원천(MySQL, Elasticsearch, S3 파일, DynamoDB)의 데이터와 서비스 로그를 S3 데이터 레이크에 입수하는 파이프라인을 직접 만들어 운영했습니다. 처음에는 Glue job 하나가 스케줄러로 동작했고, 이를 AWS MWAA로 옮겼습니다. 이 글은 전환 전 구조, 옮긴 이유, MWAA 환경 구성, 스케줄러 로직을 DAG으로 옮긴 방식, 이후 운영하며 더한 것을 정리한 기록입니다.
+여러 원천(MySQL, Elasticsearch, S3 파일, DynamoDB)의 데이터와 서비스 로그를 S3 데이터 레이크에 입수하는 파이프라인을 직접 만들어 운영했습니다. 처음에는 Glue job 하나가 스케줄러로 동작했고, 이를 AWS MWAA로 옮겼습니다. 이 글은 전환 전 구조, 옮긴 이유, MWAA 환경 구성, 스케줄러 로직을 DAG으로 옮긴 방식, 이후 운영하며 더한 것을 정리한 기록입니다. 2024-09까지 직접 운영했고, 이후 같은 구성 그대로 다른 담당자에게 넘겼습니다. 이관된 구성은 2026-06에 입수 파이프라인을 Databricks로 옮기면서 정리됐습니다.
 
-작성 2026-10-23 · 역할 입수 라이브러리와 Glue 스케줄러 설계·개발, MWAA 환경 구성과 DAG 전환(2022-10), Glue 4.0 전환(2024-08 ~ 09) · Airflow 2.2.2(MWAA) · AWS Glue 2.0 → 4.0 · Terraform
+작성 2026-10-23 · 역할 입수 라이브러리와 Glue 스케줄러 설계·개발, MWAA 환경 구성과 DAG 전환(2022-10), Glue 4.0 전환(2024-08 ~ 09), 직접 운영(~2024-09) · Airflow 2.2.2(MWAA) · AWS Glue 2.0 → 4.0 · Terraform
 {: .meta}
 
 이 글을 한 페이지로 요약한 사례: [MWAA 도입을 통한 데이터 입수 파이프라인 관리](/portfolio/mwaa-ingestion-pipeline)

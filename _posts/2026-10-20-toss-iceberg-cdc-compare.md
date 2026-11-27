@@ -5,9 +5,9 @@ tags: [Iceberg, Kafka Connect, CDC]
 author: caimask
 ---
 
-토스증권이 공개한 「Iceberg 적용기 #1: CDC 환경은 왜 제대로 동작하지 않을까?」의 문제와 해결책을 제가 만든 두 구현(Iceberg Kafka Connect sink 커넥터, 그 커넥터를 대신한 buffer + Spark 배치 구조)과 비교했습니다. 그리고 제 커넥터에 토스 방식을 적용한다면 어디를 바꿀지 계획을 정리했습니다. 4~6장의 구현 경로는 계획이며 아직 적용하지 않았습니다.
+토스증권이 공개한 「Iceberg 적용기 #1: CDC 환경은 왜 제대로 동작하지 않을까?」의 문제와 해결책을 제가 만든 두 구현(Iceberg Kafka Connect sink 커넥터, 그 커넥터를 대신한 buffer + Spark 배치 구조)과 비교했습니다. 그리고 제 커넥터에 토스 방식을 적용했다면 어디를 바꿨을지 정리했습니다. 이 글은 적재 시스템을 일몰(2024-12)한 뒤, 2025-09에 공개된 토스 글을 읽고 2026-10에 쓴 회고입니다. 그래서 4~6장의 구현 경로는 "커넥터를 유지했다면"을 가정한 설계 검토이고, 적용하지 않았습니다.
 
-작성 2026-10-20 · 역할: 커넥터 설계·개발, 이후 buffer + 배치 구조로 전환 · 원문 2025-09-10 · 토스증권 Realtime Data Team · 연관: 커밋 경합 리뷰 · Buffer Writer 배치 적재 리뷰
+작성 2026-10-20 · 역할: 커넥터 설계·개발(2023-08 ~), buffer + 배치 구조로 전환(2024-04 ~ 06), 적재 시스템 일몰(2024-12) · 원문 2025-09-10 · 토스증권 Realtime Data Team · 연관: 커밋 경합 리뷰 · Buffer Writer 배치 적재 리뷰
 {: .meta}
 
 이 글을 한 페이지로 요약한 사례: [CDC 이벤트를 Iceberg에 적재하는 파이프라인](/portfolio/cdc-iceberg-ingestion)
@@ -18,9 +18,9 @@ author: caimask
 ## 요약 {#tldr}
 
 1. **토스와 저는 같은 문제의 다른 갈래를 겪었습니다.** 토스는 처음부터 coordinator 하나가 커밋하는 커넥터(Databricks/Tabular Iceberg Sink)를 써서 커밋 경합은 없었습니다. 대신 **같은 커밋 안에서 equality delete가 제대로 동작하지 않아 중복 행이 생기는 정합성 문제**를 세 가지 경로로 겪었습니다. 제가 만든 커넥터는 task마다 `put()`마다 커밋하도록 설계해 이 중복 문제는 피했지만, 그 대가로 커밋 경합을 겪었습니다. 이 경합은 buffer + Spark 배치 구조로 바꿔 해소했습니다.
-2. **토스의 세 가지 문제는 제 커넥터 구조에서는 생기지 않았습니다.** 하지만 앞 문서에서 개선안으로 정리한 "커밋 묶기"를 적용하면, 그중 스키마 변경 문제(이슈 3)가 그대로 생긴다는 점을 적용 전에 찾았습니다. coordinator까지 도입하면 이슈 1, 2도 해당됩니다.
+2. **토스의 세 가지 문제는 제 커넥터 구조에서는 생기지 않았습니다.** 하지만 앞 문서에서 개선안으로 정리한 "커밋 묶기"를 적용하면, 그중 스키마 변경 문제(이슈 3)가 그대로 생긴다는 점을 이 비교로 확인했습니다. coordinator까지 도입하면 이슈 1, 2도 해당됩니다.
 3. **토스 방식을 구현하는 가장 짧은 길**은 제 커넥터에 ① 커밋을 일정 간격으로 묶고 ② `insertedRowMap`을 writer 밖의 레지스트리로 옮기는 것이라고 판단했습니다. 제 커넥터의 writer 핵심부(`BaseEqualityDeltaWriter`)가 토스가 쓴 커넥터와 같은 구조라서, 고칠 지점도 거의 같습니다.
-4. **토스 글은 Apache 공식 커넥터가 upsert를 지원하지 않는다고 밝혔습니다(2025년 9월 기준).** 앞 문서에서 "확인하지 못했다"고 남긴 부분입니다. 그래서 토스도 Databricks(Tabular) 버전을 썼습니다.
+4. **토스 글은 Apache 공식 커넥터가 upsert를 지원하지 않는다고 밝혔습니다(2025년 9월 기준).** 앞 문서 8장에서 정리한 Apache 버전의 upsert 공백과 같은 내용입니다. 그래서 토스도 Databricks(Tabular) 버전을 썼습니다.
 
 </div>
 
@@ -167,7 +167,7 @@ CDC source 커넥터 (Debezium) · 이벤트 변환기
 
 > **판단**
 >
-> **A로 시작하기로 판단했습니다.** 제 커넥터 구성은 모든 컬렉션이 한 토픽에 있고 task가 3개라, task별로 5분마다 커밋해도 테이블당 5분에 최대 3회입니다. 앞 문서에서 본 경합(몇 초마다 최대 8개)과 비교하면 사실상 사라지는 수준입니다. 테이블당 커밋을 하나로 줄이거나 exactly-once가 필요해지면 그때 B나 C로 갈 계획입니다. log 테이블은 D(공식 커넥터, append)로, mirror는 Spark `MERGE`로 나누는 조합도 후보로 두었습니다(7장).
+> **커넥터를 유지했다면 A부터 시작했을 것입니다.** 제 커넥터 구성은 모든 컬렉션이 한 토픽에 있고 task가 3개라, task별로 5분마다 커밋해도 테이블당 5분에 최대 3회입니다. 앞 문서에서 본 경합(몇 초마다 최대 8개)과 비교하면 사실상 사라지는 수준입니다. 테이블당 커밋을 하나로 줄이거나 exactly-once가 필요해지면 그때 B나 C로 갈 계획입니다. log 테이블은 D(공식 커넥터, append)로, mirror는 Spark `MERGE`로 나누는 조합도 후보로 두었습니다(7장).
 {: .callout .ok}
 
 ## 5. 코드 변경 사항 (1단계: 커밋 묶기 + 레지스트리) {#changes}
@@ -222,7 +222,7 @@ public Map<TopicPartition, OffsetAndMetadata> preCommit(Map<TopicPartition, Offs
 }
 ```
 
-- Kafka Connect는 `offset.flush.interval.ms`(기본 60초)마다 `preCommit()`을 부릅니다. 그래서 커밋 간격은 이 값의 배수로 잡을 계획입니다.
+- Kafka Connect는 `offset.flush.interval.ms`(기본 60초)마다 `preCommit()`을 부릅니다. 그래서 커밋 간격은 이 값의 배수로 잡아야 합니다.
 - 한 TopicPartition의 레코드가 여러 테이블로 나뉘므로, 모든 테이블 커밋이 끝난 뒤에 offset을 반환해야 합니다. 중간에 실패하면 예외를 던져 재처리합니다. upsert라 재처리해도 결과는 같습니다.
 - 파티션에 들어온 레코드가 전부 필터링되거나 변환에서 빠지면 그 파티션은 어느 테이블 상태에도 기록되지 않습니다. 이런 파티션의 offset은 Connect가 넘겨준 `current` 값으로 함께 전진시켜야 lag이 쌓이지 않습니다.
 - 건수 조건(`max-records`)도 함께 두기로 했습니다. 레지스트리와 Parquet 버퍼의 메모리 사용량이 커밋 간격 동안 들어온 키 수에 비례하기 때문입니다.
@@ -258,7 +258,7 @@ public void commit(TableState st) {
 
 ### RegistryEqualityDeltaWriter: 맵을 밖으로
 
-Iceberg의 `BaseTaskWriter.BaseEqualityDeltaWriter`를 복사해 와서 다음 부분만 고칠 계획입니다(Iceberg 1.4.x 기준 구조).
+Iceberg의 `BaseTaskWriter.BaseEqualityDeltaWriter`를 복사해 와서 다음 부분만 고치는 방식입니다(Iceberg 1.4.x 기준 구조).
 
 ```java
 // 변경 전 (Iceberg 내부)
@@ -297,12 +297,12 @@ private boolean internalPosDelete(StructLike key) {
 
 - **major mirror 테이블의 이중 writer**: snapshot 커넥터와 cdc upsert 커넥터를 시간으로 분리하거나, snapshot은 별도 테이블로 적재한 뒤 Spark `MERGE`로 반영할 계획입니다.
 - **`__source_ts_ms_ord` 인코딩**(Buffer Writer 리뷰 S3): 같은 계산이 이 커넥터의 이벤트 변환기에도 있습니다.
-- **실패 시 writer abort**: 커밋 전에 예외가 나면 열린 writer와 교체된 writer의 파일을 모두 `abort()`해서 고아 파일을 남기지 않도록 할 계획입니다.
+- **실패 시 writer abort**: 커밋 전에 예외가 나면 열린 writer와 교체된 writer의 파일을 모두 `abort()`해서 고아 파일을 남기지 않도록 합니다.
 - **컴팩션**: 커밋을 묶어도 equality delete는 계속 생깁니다. 「커밋 경합 리뷰」 7장의 증분 컴팩션을 함께 운영해야 합니다. 토스 글 댓글에서도 컴팩션 비용이 미해결 질문으로 남아 있습니다.
 
 ## 6. 코드 변경 사항 (2단계: coordinator) {#coord}
 
-테이블당 커밋을 하나로 만들고 exactly-once가 필요해지면 진행할 계획입니다. Tabular 커넥터의 구조를 따르면 다음 요소가 필요합니다.
+테이블당 커밋을 하나로 만들고 exactly-once가 필요해지면 진행하는 단계입니다. Tabular 커넥터의 구조를 따르면 다음 요소가 필요합니다.
 
 <div class="table-wrap" markdown="1">
 
@@ -334,7 +334,7 @@ private boolean internalPosDelete(StructLike key) {
 
 > **검증할 전제**
 >
-> source가 AWS DocumentDB입니다. 토스 글과 이 문서의 분석은 Debezium MongoDB 커넥터의 키와 순서 의미를 전제로 합니다. DocumentDB change stream에서 `source.ord`와 키 형식이 MongoDB와 같은지, 1단계 적용 전에 실제 데이터로 검증할 계획입니다.
+> source는 처음 AWS DocumentDB였고, 운영 중 MongoDB Atlas로 바뀌었습니다. 토스 글과 이 문서의 분석은 Debezium MongoDB 커넥터의 키와 순서 의미를 전제로 합니다. DocumentDB 기간의 change stream에서 `source.ord`와 키 형식이 MongoDB와 같은지는 확인하지 않았습니다. 같은 구조를 다시 만든다면 1단계 전에 실제 데이터로 검증할 항목입니다.
 {: .callout .warn}
 
 ## 8. 성과와 기대 효과 {#outcome}
@@ -350,13 +350,13 @@ private boolean internalPosDelete(StructLike key) {
 | 정합성 | 토스가 운영 중에 겪은 세 가지 중복 문제가 제 커넥터 구조에서는 생기지 않았음. Kafka 키가 테이블 id와 같고(이슈 1), 커밋이 `put()` 단위라 writer와 맵의 수명이 커밋과 같음(이슈 2, 3) |
 | writer 설계 | writer 핵심부(`BaseEqualityDeltaWriter`)가 토스가 쓴 커넥터와 같은 구조. 같은 커밋 안의 중복은 position delete, 이전 커밋의 행은 equality delete로 지우는 규칙을 이미 따름 |
 | 구조 전환 (적용함) | buffer + Spark 배치로 바꾸면서 커밋 경합과 equality delete를 함께 없앰. 테이블당 커밋 주체 최대 8개 task → 배치 job 1개, 커밋 몇 초마다 → 10분에 테이블당 2~3회, equality delete 0. 토스와는 다른 갈래로 같은 문제를 푼 셈 |
-| 분석 | 다음 단계로 계획한 "커밋 묶기"가 이슈 3을 새로 만든다는 점을 **적용 전에** 찾아, 회귀를 막을 수정 지점(레지스트리)을 미리 정함 |
+| 분석 | 커밋 경합 리뷰에서 개선안으로 정리한 "커밋 묶기"가 이슈 3을 새로 만든다는 점을 이 비교로 찾고, 회귀를 막을 수정 지점(레지스트리)을 정리함 |
 
 </div>
 
 ### 개선을 적용하면 얻는 것
 
-제 커넥터에 토스 방식을 적용할 때의 예상입니다. 아직 적용하지 않은 계획이며, 수치는 운영 설정(task 3개, 토픽 1개, 커밋 간격 5분)으로 계산했습니다.
+제 커넥터에 토스 방식을 적용했다면의 예상입니다. 적재 시스템을 일몰해 적용하지 않은 가정이며, 수치는 운영 설정(task 3개, 토픽 1개, 커밋 간격 5분)으로 계산했습니다.
 
 <div class="table-wrap" markdown="1">
 
@@ -378,7 +378,7 @@ private boolean internalPosDelete(StructLike key) {
 
 > **측정 방법**
 >
-> 같은 커밋 안의 중복은 mirror 테이블에서 `GROUP BY id HAVING count(*) > 1`로 바로 확인할 수 있습니다. 1단계를 적용하면 스키마 변경이 있었던 날을 골라 이 쿼리가 0건인지 보는 방식으로 레지스트리가 제대로 동작하는지 검증할 계획입니다.
+> 같은 커밋 안의 중복은 mirror 테이블에서 `GROUP BY id HAVING count(*) > 1`로 바로 확인할 수 있습니다. 1단계를 적용하면 스키마 변경이 있었던 날을 골라 이 쿼리가 0건인지 보는 방식으로 레지스트리가 제대로 동작하는지 검증합니다.
 {: .callout .info}
 
 * * *

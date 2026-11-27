@@ -5,9 +5,9 @@ tags: [Iceberg, Kafka Connect]
 author: caimask
 ---
 
-MongoDB CDC 이벤트를 Kafka에서 Iceberg로 적재하려고 제가 설계·개발한 Sink Connector가 왜 느렸는지 돌아본 문서입니다. 당시 세웠던 "Iceberg도 이제 row lock으로 처리된다"는 가정이 맞았는지, 대용량 데이터를 빠르게 적재하려면 어떤 구조가 맞는지를 함께 정리했습니다. 이 검토를 바탕으로 커넥터를 고치는 대신 buffer sink 커넥터 + Spark 배치 구조로 전환했고, 전환한 구조는 [Buffer Writer 배치 적재 리뷰](/2026/10/15/buffer-writer-batch-review.html)에서 다룹니다.
+원본 DB(처음 AWS DocumentDB, 이후 MongoDB Atlas)의 CDC 이벤트를 Kafka에서 Iceberg로 적재하려고 제가 설계·개발한 Sink Connector가 왜 느렸는지 돌아본 문서입니다. 당시 세웠던 "Iceberg도 이제 row lock으로 처리된다"는 가정이 맞았는지, 대용량 데이터를 빠르게 적재하려면 어떤 구조가 맞는지를 함께 정리했습니다. 커넥터를 고치는 대신 2024-04 ~ 06에 buffer sink 커넥터 + Spark 배치 구조로 전환했고, 적재 시스템 전체는 2024-12에 일몰했습니다. 이 문서는 일몰 후 2026-10에 다시 쓴 회고입니다. 전환한 구조는 [Buffer Writer 배치 적재 리뷰](/2026/10/15/buffer-writer-batch-review.html)에서 다룹니다.
 
-역할: 커넥터 설계·개발(2023-08 ~ 2024-12 archive), 이후 buffer + Spark 배치 구조로 전환
+역할: 커넥터 설계·개발(2023-08 ~), buffer + Spark 배치 구조로 전환(2024-04 ~ 06), 적재 시스템 일몰(2024-12)
 {: .meta}
 
 이 글을 한 페이지로 요약한 사례: [CDC 이벤트를 Iceberg에 적재하는 파이프라인](/portfolio/cdc-iceberg-ingestion)
@@ -20,7 +20,7 @@ MongoDB CDC 이벤트를 Kafka에서 Iceberg로 적재하려고 제가 설계·�
 
 ## 요약 {#tldr}
 
-1. **당시 "table lock" 현상의 정체**: Iceberg는 lock을 쓰지 않고 낙관적 동시성 제어(OCC)로 동작합니다. 한 테이블의 커밋은 한 번에 하나씩만 반영되며, 경쟁에서 진 writer는 재시도합니다. 커넥터를 **몇 초마다, 테이블당 최대 8개 writer에서** 커밋하도록 만든 것이 원인이었고, 그 결과 재시도가 폭주했습니다. 커밋 단계만 보면 table lock과 같은 효과이고, 충돌이 잦을 때는 재작업과 backoff 때문에 lock보다 오히려 느릴 수 있습니다.
+1. **당시 "table lock" 현상의 정체**: Iceberg는 쓰는 동안 테이블을 잠그지 않고 낙관적 동시성 제어(OCC)로 커밋합니다. 한 테이블의 커밋은 한 번에 하나씩만 반영되며, 경쟁에서 진 writer는 재시도합니다. 커넥터를 **몇 초마다, 테이블당 최대 8개 writer에서** 커밋하도록 만든 것이 원인이었고, 그 결과 재시도가 폭주했습니다. 커밋 단계만 보면 table lock과 같은 효과이고, 충돌이 잦을 때는 재작업과 backoff 때문에 lock보다 오히려 느릴 수 있습니다.
 2. **row lock은 Iceberg 공통 스펙이 아닙니다**: Databricks가 발표한 row-level concurrency는 Delta Lake 기능입니다. 이 기능도 커밋 직렬화를 없애지 않고, 충돌을 행 단위로 판정해 **실패를 줄여 줄 뿐**입니다. Iceberg v3(deletion vector, row lineage)도 커밋 모델은 그대로입니다.
 3. **커밋을 묶어도 변경 이력은 사라지지 않습니다**: 중간 변경 이력을 잃지 않으려고 커밋을 자주 하도록 설계했지만, 커밋을 자주 해도 한 배치 안의 중간 변경은 mirror 테이블에서 사라졌습니다. 변경 이력은 스냅샷이 아니라 log 테이블의 **행**으로 보존해야 하며, log 테이블은 처음부터 그렇게 설계해 두었습니다.
 4. **처리량과 커밋 빈도는 별개입니다**: 대용량 적재의 표준은 **병렬 writer + 테이블당 단일 committer + 1~5분 커밋**입니다. 커밋 직렬화가 정하는 것은 데이터 최신성의 하한이지 처리량이 아닙니다.
@@ -96,14 +96,14 @@ MongoDB CDC 이벤트를 Kafka에서 Iceberg로 적재하려고 제가 설계·�
 - <span class="pill warn">개선</span> `RuntimeException`을 던지면 task가 FAILED로 멈췄습니다. `errors.retry.timeout`은 converter와 SMT에만 적용되고 `put()`에는 적용되지 않습니다.
 - <span class="pill warn">개선</span> `iceberg-spark-runtime`을 통째로 포함해 jar가 무거웠습니다. Iceberg 1.4.3도 오래된 버전입니다.
 
-상태: 이 항목들은 커넥터에서 고치지 않았습니다. 커넥터는 2024-12에 archive했고, 적재를 buffer + Spark 배치 구조로 옮겼습니다. 그중 반쪽 파일 문제는 전환 후 buffer writer가 업로드 실패 시 multipart upload를 abort하는 방식으로 다뤘습니다.
+상태: 이 항목들은 커넥터에서 고치지 않았습니다. 2024-04 ~ 06에 적재를 buffer + Spark 배치 구조로 옮겼고, 2024-12에 적재 시스템 전체를 일몰했습니다. 그중 반쪽 파일 문제는 전환 후 buffer writer가 업로드 실패 시 multipart upload를 abort하는 방식으로 다뤘습니다.
 
 ## 2. table lock과 row lock의 실체 {#lock}
 
 **당시 가정** 적재가 느린 원인을 table lock으로 봤습니다. 그리고 "Iceberg도 이제 row lock으로 동시 커밋을 처리한다"는 이야기가 있었으므로, lock 문제를 버전 업그레이드로 풀 수 있다고 봤습니다.
 {: .q}
 
-**확인한 사실** Iceberg는 처음부터 lock을 쓰지 않습니다. 데이터 파일과 메타데이터를 먼저 쓰고, 마지막에 카탈로그(Glue)의 metadata 포인터를 원자적으로 교체하는 방식으로 커밋합니다.
+**확인한 사실** Iceberg의 커밋은 쓰는 동안 테이블을 잠그는 lock 방식이 아니라 낙관적 동시성 제어입니다. 데이터 파일과 메타데이터를 먼저 쓰고, 마지막에 카탈로그(Glue)의 metadata 포인터를 "내가 읽은 버전일 때만" 원자적으로 교체합니다. 카탈로그 구현에 따라 이 교체 순간을 lock으로 보호하기도 하지만(예: Hive Metastore), 그 lock도 포인터를 바꾸는 순간에만 잡습니다.
 
 ```
 writer A: [데이터 파일 쓰기]──┐ commit(base=v10 → v11)  성공
@@ -456,7 +456,7 @@ ADD PARTITION FIELD bucket(16, _oid);
 
 - log 테이블에 append하고 Spark `MERGE INTO`로 mirror에 반영하면, MERGE는 대상 파일을 이미 찾았으므로 equality delete 대신 **position delete**를 씁니다. 영향 범위가 특정 파일의 특정 행으로 좁혀집니다.
 - **Iceberg v3의 deletion vector가 여기서 효과를 냅니다.** data 파일당 delete 정보가 하나(DV)로 유지되어 delete 파일이 끝없이 쌓이는 구조가 사라집니다.
-- 업데이트가 아주 많은 테이블은 copy-on-write(`write.merge.mode=copy-on-write`)도 선택지입니다. 쓰기는 무겁지만 delete 파일이 생기지 않습니다.
+- 읽기가 많고 업데이트가 적은 테이블은 copy-on-write(`write.merge.mode=copy-on-write`)도 선택지입니다. delete 파일이 생기지 않지만, 바뀐 행이 든 data 파일을 통째로 다시 쓰므로 업데이트가 많은 테이블에는 맞지 않습니다.
 
 ### 필요한 운영 작업과 실행 순서
 
@@ -582,8 +582,9 @@ equality delete 파일(content=2) 수가 data 파일 수에 가깝거나 더 많
 | 2023-09-19 | Tabular에 CDC/upsert용 ID 컬럼 설정 추가 (0.4.x → 0.5) |
 | 2023-11 ~ 12 | 자체 커넥터 운영 대응: create에도 delete 선행, 테이블별 병렬 처리 시도 후 원복 |
 | 2024-04-23 | Tabular에 MongoDB Debezium SMT가 처음 추가됨 |
+| 2024-04 ~ 06 | 자체 buffer sink + Spark 배치로 전환. 이때 공식 계열 커넥터는 조사하지 않음 |
 | 2024-11 | Apache Iceberg 1.7.0에 Kafka Connect Sink 포함. **upsert는 빠짐** |
-| 2024-12-26 | 자체 커넥터 archive |
+| 2024-12-26 | 적재 시스템 전체 일몰. 분석 요구 사항이 준비되지 않아 적재가 아직 필요 없다고 판단 |
 | 2026-08 | Apache에 기증 전 upsert 기능을 되살리자는 이슈([#17542](https://github.com/apache/iceberg/issues/17542))가 올라옴. 이 문서를 고친 시점에 아직 열려 있음 |
 
 </div>
@@ -600,7 +601,7 @@ equality delete 파일(content=2) 수가 data 파일 수에 가깝거나 더 많
 | 전달 보장 | at-least-once. upsert라 재처리해도 결과가 같음 | exactly-once (KIP-447) | 같음 |
 | upsert | 항상 delete 후 write | `upsert-mode-enabled`, `cdc-field` | <span class="pill bad">없음</span> 설정 키가 없음 |
 | 삭제 이벤트 | `upsert.keep-deletes=true`면 행을 지우지 않고 `__op=d`로 남김 | 행을 삭제 | 해당 없음 |
-| MongoDB 이벤트 | BSON 문자열인 `after`를 직접 파싱. `updateDescription` 유무로 UPDATE와 REPLACE 구분 | 2024-04 이전에는 없음 | `MongoDebeziumTransform` (Experimental) |
+| MongoDB 이벤트 | Extended JSON 문자열인 `after`를 직접 파싱. `updateDescription` 유무로 UPDATE와 REPLACE 구분 | 2024-04 이전에는 없음 | `MongoDebeziumTransform` (Experimental) |
 | 변경 메타데이터 | `__updated_fields`, `__removed_fields`, `__source_ts_ms_ord`, `__event_ts_ms`, `__kafka_ts_ms` | `_cdc.op`, `_cdc.ts`, `_cdc.source` 등 | 같음 |
 | 작업 코드 | 자체 이벤트 모델의 작업 코드에 맞춤 | Debezium의 c/u/d | 같음 |
 | 테이블 결정 | 테이블 이름 규칙 설정(`{database}_{table}`), 컬렉션 include/exclude 목록 | `route-regex` 또는 `route-field` | 같음 |
@@ -613,7 +614,7 @@ equality delete 파일(content=2) 수가 data 파일 수에 가깝거나 더 많
 
 ### 직접 구현한 이유
 
-1. **MongoDB 이벤트를 받아 주는 공식 커넥터가 없었습니다.** 원본 이벤트의 `after`는 BSON 문자열이고, Kafka 키인 `_id`도 JSON 문자열입니다. getindata와 Tabular 모두 Debezium의 관계형 DB 이벤트 형식을 기준으로 만들어져, 이 형식을 해석하지 못했습니다. Tabular에 Mongo용 SMT가 생긴 것은 자체 커넥터를 운영하던 2024-04입니다.
+1. **MongoDB 이벤트를 받아 주는 공식 커넥터가 없었습니다.** 원본 이벤트의 `after`는 MongoDB Extended JSON 문자열이고, Kafka 키인 `_id`도 JSON 문자열입니다. getindata와 Tabular 모두 Debezium의 관계형 DB 이벤트 형식을 기준으로 만들어져, 이 형식을 해석하지 못했습니다. Tabular에 Mongo용 SMT가 생긴 것은 자체 커넥터를 운영하던 2024-04입니다.
 2. **변환 규칙을 사내 데이터 모델에 맞췄습니다.** REPLACE 구분, 자체 이벤트 모델의 작업 코드, `__updated_fields`/`__removed_fields`, soft delete, snake_case 변환이 그렇습니다. 지금 공식 SMT로도 대부분 만들 수 없습니다. 실제로 이벤트 변환기가 전체 코드의 약 4분의 1로 가장 큽니다.
 3. **upsert가 필요했는데, 공식 계열은 아직 초기였습니다.** 당시 Tabular 커넥터는 0.x였습니다. Apache 버전은 지금도 upsert를 지원하지 않습니다.
 4. **참고한 구현이 getindata였습니다.** 그래서 coordinator 없이 `put()`마다 커밋하는 구조도 함께 가져왔습니다. 이 문서에서 다룬 커밋 경합은 공식 커넥터를 쓰지 않아서 생긴 것이라기보다, 제가 **출발점으로 삼은 코드의 커밋 모델**을 그대로 둔 데서 생겼습니다.
@@ -665,7 +666,7 @@ sink task · 테이블별 write worker (원복으로 삭제됨)
 >
 > 제가 직접 구현하기로 한 것은 공식 커넥터를 두고 고르지 않은 것이 아니라, 2023년 8월에 MongoDB와 사내 이벤트 모델을 받아 주는 공식 커넥터가 없었기 때문입니다. 대신 getindata의 커밋 모델을 함께 가져오면서, 공식 커넥터의 핵심인 **테이블당 단일 committer**가 빠졌습니다. 지금 옮긴다면 변환 로직은 SMT로 살리고 커밋은 공식 커넥터에 맡기는 방식이 됩니다.
 >
-> 실제로는 공식 커넥터로 옮기지 않았습니다. 테이블당 단일 committer라는 핵심만 가져와, buffer sink 커넥터 + Spark 배치 구조(배치 job 1개가 테이블당 커밋)로 전환했습니다(9장).
+> 실제로는 공식 커넥터로 옮기지 않았습니다. 테이블당 단일 committer라는 핵심만 가져와, buffer sink 커넥터 + Spark 배치 구조(배치 job 1개가 테이블당 커밋)로 전환했습니다(9장). 이때 공식 계열 커넥터를 따로 조사하지는 않았습니다. 당시 Tabular 커넥터에는 이미 coordinator와 upsert가 있었으므로, 먼저 조사했다면 자체 개발 범위를 줄일 수 있었습니다.
 {: .callout .info}
 
 ## 9. 이 프로젝트 적용안 {#plan}
@@ -798,7 +799,7 @@ log 테이블은 공식 Iceberg Kafka Connect Sink 또는 Flink로 append합니�
 
 > **측정 방법**
 >
-> 7장의 `files`, `snapshots` 메타데이터 쿼리로 delete 파일 비율, 평균 파일 크기, 시간당 커밋 수를 비교할 수 있습니다. 이 문서에는 전환 전후 실측값을 아직 넣지 않았고, 위 표에서 "실측값 없음"인 칸이 이 쿼리로 채울 항목입니다.
+> 7장의 `files`, `snapshots` 메타데이터 쿼리로 delete 파일 비율, 평균 파일 크기, 시간당 커밋 수를 비교할 수 있습니다. 적재 시스템을 2024-12에 일몰해 전환 전후 실측값은 지금 확인할 수 없습니다. 위 표에서 "실측값 없음"인 칸은 같은 구조를 다시 운영할 때 이 쿼리로 먼저 채울 항목입니다.
 {: .callout .info}
 
 * * *

@@ -7,7 +7,7 @@ author: caimask
 
 이벤트 기반 데이터 파이프라인의 커넥터들이 도는 Kafka Connect 클러스터를 공용 EKS에 Helm chart로 구성하고, 공식 이미지(`confluentinc/cp-kafka-connect`)를 다시 빌드해 운영한 기록입니다. 클러스터와 배포 구조를 먼저 정리하고, 운영 중 설정으로 풀리지 않아 오픈소스 코드를 직접 고친 세 가지를 문제 → 원인 → 수정 → 대가 순서로 적었습니다.
 
-작성 2026-10-23 · 역할: Helm chart 구성, 이미지 재빌드 구조 설계, 커넥터 배포 CI, 오픈소스 패치(Avro Converter, Debezium MongoDB 커넥터)(2023-08 ~ 2026-09) · Confluent Platform 7.2.6 · Debezium 2.0.1
+작성 2026-10-23 · 역할: Helm chart 구성, 이미지 재빌드 구조 설계, 커넥터 배포 CI, 오픈소스 패치(Avro Converter, Debezium MongoDB 커넥터)(2023-08 ~ 2025-10) · Confluent Platform 7.2.6 · Debezium 2.0.1
 {: .meta}
 
 이 글을 포함하는 사례: [이벤트 기반 데이터 파이프라인 구축](/portfolio/event-driven-pipeline)

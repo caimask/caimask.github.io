@@ -7,7 +7,9 @@ author: caimask
 
 Kafka Connect upsert 커넥터의 커밋 경합을 피하려고 제가 설계·개발해 전환한 구조, 즉 이벤트를 10분 단위 Parquet 파일로 S3에 버퍼링하고 Spark 배치로 Iceberg log/mirror 테이블에 적재하는 방식을 직접 돌아본 회고입니다. 전환으로 얻은 결과를 먼저 정리하고, 이후 자기 검토에서 찾은 결함과 각각의 개선 방향을 적었습니다. 「Iceberg 커밋 경합 리뷰」 문서의 후속편입니다.
 
-작성 2026-10-15 · 역할: buffer sink 커넥터와 Spark 배치(`batch-writer`) 설계·개발, 커넥터 구조에서의 전환 · Parquet 1.13.1 · PySpark 3.5.0 · Kyuubi
+이 구조는 2024-04 ~ 06에 만들어 전환했고, 2024-12에 적재 시스템 전체와 함께 일몰했습니다. 데이터 레이크는 분석을 목적으로 구성했지만, 분석 요구 사항이 준비되지 않은 상태에서 적재 시스템을 계속 운영할 필요는 없다고 판단했습니다. 이 글은 일몰 후 2026-10에 코드를 다시 읽고 쓴 회고이므로, 아래 개선안은 운영 중인 시스템에 적용할 계획이 아니라 같은 구조를 다시 만들 때 먼저 고칠 항목입니다.
+
+작성 2026-10-15 · 역할: buffer sink 커넥터와 Spark 배치(`batch-writer`) 설계·개발, 커넥터 구조에서의 전환(2024-04 ~ 06), 적재 시스템 일몰(2024-12) · Parquet 1.13.1 · PySpark 3.5.0 · Kyuubi
 {: .meta}
 
 이 글을 한 페이지로 요약한 사례: [CDC 이벤트를 Iceberg에 적재하는 파이프라인](/portfolio/cdc-iceberg-ingestion)
@@ -74,7 +76,7 @@ S3 buffer/{topic}/{yyyyMMddHHmm}/{topic}+{partition}+{windowStartMs}.gz.parquet
 | 커밋 빈도 | 몇 초마다 | <span class="pill ok">10분마다</span> 테이블당 2~3회 |
 | 삭제 방식 | equality delete | <span class="pill ok">없음</span> log는 append, mirror는 CoW `MERGE` |
 | 재처리 멱등성 | upsert에 의존 | <span class="pill ok">양호</span> 파일명 고정 + OVERWRITE, log는 파티션 단위 덮어쓰기 |
-| 최신성 | 수 초 | <span class="pill warn">15~25분</span> 윈도우 10분 + 대기 5분 + 실행 시간 |
+| 최신성 | 수 초 | <span class="pill warn">15~25분</span> 윈도우 10분 + 대기 5분 + 실행 시간. 처음 목표는 이벤트 기반 실시간 반영이었지만, 모든 변경을 실시간으로 mirror 스냅샷에 반영하기는 어렵다고 판단해 내부적으로 다시 정한 수준 |
 | 데이터 완전성 | offset 커밋으로 보장 | <span class="pill bad">취약</span> 윈도우 완료를 벽시계로 판단 (3장) |
 | 운영 구성요소 | 커넥터 1종 | <span class="pill warn">증가</span> 커넥터, S3 버퍼, CronJob, Kyuubi, checkpoint 파일 |
 
@@ -475,7 +477,7 @@ sourceTsMsOrd = sourceTsMs * 1_000_000L + sourceOrd;   // 약 1.8e18, long 범�
 
 ## 7. 우선순위 {#plan}
 
-자기 검토 후 정한 적용 순서입니다. 모두 아직 적용 전입니다.
+자기 검토 후 정한 적용 순서입니다. 시스템을 일몰해 적용하지 않았고, 같은 구조를 다시 만든다면 이 순서로 고칩니다.
 
 <div class="steps" markdown="1">
 
@@ -559,7 +561,7 @@ S6 merge-on-read 전환 + 컴팩션(앞 문서 7장), 또는 `bucket(id_id)`. �
 
 ### 개선을 적용하면 얻는 것
 
-아래 개선은 아직 적용하지 않았습니다. 수치는 코드와 운영 설정에서 계산한 예상치이며, 적용 후 측정값으로 바꿀 예정입니다.
+아래 개선은 적용하지 않았습니다(2024-12 일몰). 수치는 코드와 운영 설정에서 계산한 예상치이며, 일몰한 시스템의 실측값은 지금 확인할 수 없습니다.
 
 <div class="table-wrap" markdown="1">
 
